@@ -15,9 +15,16 @@ __pycache__/
 # Challenge dataset
 dataset/
 
-# Generated outputs
+# Generated outputs and local reports
 output.csv
 *.log
+reports/
+.pytest_tmp/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
 
 # IDE and OS files
 .vscode/
