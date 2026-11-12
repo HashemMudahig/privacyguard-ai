@@ -8,6 +8,7 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from ..activity.models import SystemActivity
 from ..errors import DatasetError
 from ..models import AuditEvent, DeletionRequest, UserIdentity
 from .types import DatasetFile, LoadedRow
@@ -31,6 +32,16 @@ AUDIT_HEADERS = (
     "field_name",
     "old_value",
     "new_value",
+)
+ACTIVITY_HEADERS = (
+    "activity_id",
+    "event_time",
+    "event_type",
+    "source_system",
+    "target_system",
+    "resource_id",
+    "reported_result",
+    "details",
 )
 
 
@@ -112,5 +123,19 @@ def load_audit_events(
         resolved,
         AuditEvent,
         AUDIT_HEADERS,
+        display_name or f"dataset/{resolved.name}",
+    )
+
+
+def load_system_activity(
+    path: str | Path,
+    display_name: str | None = None,
+) -> DatasetFile[SystemActivity]:
+    """Load ``system_activity.csv``."""
+    resolved = Path(path)
+    return _load_csv(
+        resolved,
+        SystemActivity,
+        ACTIVITY_HEADERS,
         display_name or f"dataset/{resolved.name}",
     )
