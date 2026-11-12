@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
 from .config import Settings
+from .decision.models import DeletionStatus
+from .evaluation.report import write_evaluation_json
+from .pipeline import AuditPipeline
 from .context.report import write_context_json
 from .context.service import AuditContextService
 from .errors import PrivacyGuardError
@@ -159,6 +163,48 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     inspect_case.add_argument("--limit", type=int, default=50, help="Maximum resources to show.")
+
+    audit_sample = subparsers.add_parser(
+        "audit-sample", help="Run the full audit pipeline on the 32 sample requests."
+    )
+    _add_common_options(audit_sample)
+    audit_sample.add_argument(
+        "--output",
+        default="reports/sample_output_generated.csv",
+        help="Generated sample CSV path inside this project.",
+    )
+
+    audit_eval = subparsers.add_parser(
+        "audit-eval", help="Run the full audit pipeline on the 518 evaluation requests."
+    )
+    _add_common_options(audit_eval)
+    audit_eval.add_argument(
+        "--output",
+        default="output.csv",
+        help="Generated evaluation CSV path inside this project.",
+    )
+
+    validate_output = subparsers.add_parser(
+        "validate-output", help="Validate a generated output CSV."
+    )
+    _add_common_options(validate_output)
+    validate_output.add_argument("--path", required=True, help="Output CSV path.")
+    validate_output.add_argument(
+        "--requests",
+        choices=("sample", "eval"),
+        required=True,
+        help="Expected request set.",
+    )
+
+    evaluate_sample = subparsers.add_parser(
+        "evaluate-sample", help="Evaluate generated sample answers against sample_output.csv."
+    )
+    _add_common_options(evaluate_sample)
+    evaluate_sample.add_argument(
+        "--json-out",
+        default=None,
+        help="Optional evaluation JSON path inside this project.",
+    )
     return parser
 
 
@@ -558,6 +604,81 @@ def _cmd_inspect_case(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _status_counts(results) -> Counter[str]:
+    return Counter(result.deletion_status.value for result in results)
+
+
+def _run_audit(settings: Settings, args: argparse.Namespace, choice: str) -> int:
+    pipeline = AuditPipeline(settings.require_dataset())
+    results = pipeline.audit_requests(choice)
+    destination = pipeline.write_results(results, Path(args.output))
+    validation = pipeline.validate_output(destination, choice=choice)
+    counts = _status_counts(results)
+    print(f"Audit {choice} cases: {len(results)}")
+    print(f"  output      : {destination}")
+    for status in DeletionStatus:
+        print(f"  {status.value:<15} {counts.get(status.value, 0)}")
+    print(f"  validation  : {'PASS' if validation.valid else 'FAIL'}")
+    print(f"  rows        : {validation.rows}")
+    for error in validation.errors[:20]:
+        print(f"  ERROR: {error}")
+    return 0 if validation.valid else 1
+
+
+def _cmd_validate_output(settings: Settings, args: argparse.Namespace) -> int:
+    pipeline = AuditPipeline(settings.require_dataset())
+    validation = pipeline.validate_output(Path(args.path), choice=args.requests)
+    print(f"Validation: {'PASS' if validation.valid else 'FAIL'}")
+    print(f"  path   : {Path(args.path).resolve()}")
+    print(f"  rows   : {validation.rows}")
+    print(f"  errors : {len(validation.errors)}")
+    for error in validation.errors[:50]:
+        print(f"  ERROR: {error}")
+    for warning in validation.warnings[:20]:
+        print(f"  WARN: {warning}")
+    return 0 if validation.valid else 1
+
+
+def _cmd_evaluate_sample(settings: Settings, args: argparse.Namespace) -> int:
+    pipeline = AuditPipeline(settings.require_dataset())
+    results = pipeline.audit_requests("sample")
+    report = pipeline.evaluate_sample(results)
+    print("Sample evaluation")
+    print(
+        f"  cases                 : {report.total_cases}\n"
+        f"  status accuracy       : {report.status_correct}/{report.total_cases} "
+        f"({report.status_accuracy:.4f})\n"
+        f"  exact case matches    : {report.exact_case_matches}/{report.total_cases} "
+        f"({report.exact_case_accuracy:.4f})\n"
+        f"  step precision        : {report.step_precision:.4f}\n"
+        f"  step recall           : {report.step_recall:.4f}\n"
+        f"  step F1               : {report.step_f1:.4f}\n"
+        f"  field accuracy        : {report.field_accuracy:.4f}\n"
+        f"  evidence accuracy     : {report.evidence_accuracy:.4f}\n"
+        f"  sequence accuracy     : {report.sequence_accuracy:.4f}"
+    )
+    print("  status mismatches:")
+    mismatches = [item for item in report.diagnostics if not item.status_correct]
+    if mismatches:
+        for item in mismatches:
+            print(
+                f"    {item.case_id}: expected {item.expected_status}, got {item.actual_status}"
+            )
+    else:
+        print("    none")
+    print("  step mismatches (top 10):")
+    step_mismatches = [item for item in report.diagnostics if not item.exact_steps]
+    for item in step_mismatches[:10]:
+        print(
+            f"    {item.case_id}: missing={len(item.missing_steps)} "
+            f"extra={len(item.extra_steps)} changed_fields={len(item.changed_fields)}"
+        )
+    if args.json_out:
+        destination = write_evaluation_json(Path(args.json_out), report)
+        print(f"Evaluation JSON written to: {destination}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -584,6 +705,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         if args.command == "inspect-case":
             return _cmd_inspect_case(settings, args)
+        if args.command == "audit-sample":
+            return _run_audit(settings, args, "sample")
+        if args.command == "audit-eval":
+            return _run_audit(settings, args, "eval")
+        if args.command == "validate-output":
+            return _cmd_validate_output(settings, args)
+        if args.command == "evaluate-sample":
+            return _cmd_evaluate_sample(settings, args)
         parser.error(f"Unknown command: {args.command}")
         return 2
     except PrivacyGuardError as exc:
