@@ -9,13 +9,20 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import Settings
+from .context.report import write_context_json
+from .context.service import AuditContextService
 from .errors import PrivacyGuardError
+from .evidence.index import EvidenceIndex
+from .evidence.manifest import load_evidence_manifest
+from .evidence.parsers.registry import parser_for
+from .evidence.report import write_inventory_json
+from .evidence.service import build_evidence
 from .identity.index import IdentityIndex
 from .identity.report import summarize_resolutions, write_json_report
 from .identity.resolver import IdentityResolver
 from .io.bundle import DatasetBundle, load_dataset
 from .io.types import DatasetFile
-from .models import ResolutionStatus
+from .models import ResolutionStatus, parse_timestamp
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
@@ -82,6 +89,76 @@ def _build_parser() -> argparse.ArgumentParser:
             "for example reports/identity_report_sample.json"
         ),
     )
+
+    evidence = subparsers.add_parser(
+        "evidence", help="Inspect and index evidence files."
+    )
+    evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
+
+    inventory = evidence_sub.add_parser(
+        "inventory", help="Parse all evidence and report coverage."
+    )
+    _add_common_options(inventory)
+    inventory.add_argument(
+        "--json-out",
+        default=None,
+        help="Optional inventory JSON path inside this project.",
+    )
+
+    inspect = evidence_sub.add_parser(
+        "inspect", help="Parse and inspect one evidence file."
+    )
+    _add_common_options(inspect)
+    inspect.add_argument("--file-id", required=True, help="Manifest file_id.")
+    inspect.add_argument("--limit", type=int, default=20, help="Maximum observations to show.")
+    inspect.add_argument(
+        "--show-identifiers",
+        action="store_true",
+        help="Show raw identifier values. Off by default to avoid unnecessary PII output.",
+    )
+    inspect.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full observations as JSON (may contain personal data).",
+    )
+
+    for_user = evidence_sub.add_parser(
+        "for-user", help="Query evidence associated with a resolved user."
+    )
+    _add_common_options(for_user)
+    identity_group = for_user.add_mutually_exclusive_group(required=True)
+    identity_group.add_argument("--user-id", help="Stable internal user_id.")
+    identity_group.add_argument("--email", help="Current or historical email.")
+    identity_group.add_argument("--phone", help="Current or historical phone.")
+    identity_group.add_argument("--email-hash", help="Current or historical email hash.")
+    for_user.add_argument(
+        "--audit-at",
+        default=None,
+        help="Only use evidence captured at or before this ISO-8601 timestamp.",
+    )
+    for_user.add_argument("--limit", type=int, default=20, help="Maximum observations to show.")
+
+    inspect_case = subparsers.add_parser(
+        "inspect-case",
+        help="Build and explain the audit context for one request case.",
+    )
+    _add_common_options(inspect_case)
+    inspect_case.add_argument("--case-id", required=True, help="Case identifier.")
+    inspect_case.add_argument(
+        "--requests",
+        choices=("sample", "eval", "all"),
+        default="all",
+        help="Which request file the case belongs to.",
+    )
+    inspect_case.add_argument(
+        "--json-out",
+        default=None,
+        help=(
+            "Optional full-context JSON path inside this project. "
+            "The JSON contains personal data from the source dataset."
+        ),
+    )
+    inspect_case.add_argument("--limit", type=int, default=50, help="Maximum resources to show.")
     return parser
 
 
@@ -195,6 +272,292 @@ def _cmd_audit_requests(settings: Settings, args: argparse.Namespace) -> int:
     return 0 if summary.not_found == 0 and summary.ambiguous == 0 else 1
 
 
+def _cmd_evidence_inventory(settings: Settings, args: argparse.Namespace) -> int:
+    build = build_evidence(settings.require_dataset())
+    inventory = build.inventory
+
+    print("Evidence inventory")
+    print(f"  dataset              : {inventory.dataset}")
+    print(f"  manifest             : {inventory.manifest_path}")
+    print(f"  entries              : {inventory.total_entries}")
+    print(f"  supported entries    : {inventory.supported_entries}")
+    print(f"  unsupported entries  : {inventory.unsupported_entries}")
+    print(f"  parsed files         : {inventory.parsed_files}")
+    print(f"  failed files         : {inventory.failed_files}")
+    print(f"  observations         : {inventory.observation_count}")
+    print(f"  parse warnings       : {inventory.parse_warnings}")
+    print("  files by format      : " + ", ".join(
+        f"{key}={value}" for key, value in inventory.files_by_format.items()
+    ))
+    print("  observations/format  : " + ", ".join(
+        f"{key}={value}" for key, value in inventory.observations_by_format.items()
+    ))
+    print("  observations/state   : " + ", ".join(
+        f"{key}={value}" for key, value in inventory.observations_by_state.items()
+    ))
+
+    if inventory.unsupported:
+        print("  unsupported files    :")
+        for unsupported in inventory.unsupported:
+            print(
+                f"    {unsupported.file_id} | {unsupported.format.value} | "
+                f"{unsupported.reason}"
+            )
+    if inventory.failures:
+        print("  parse failures       :")
+        for failure in inventory.failures:
+            print(
+                f"    {failure.file_id} | {failure.format.value} | "
+                f"{failure.error_type} | {failure.reason}"
+            )
+    if inventory.manifest_issues:
+        print("  manifest issues      :")
+        for issue in inventory.manifest_issues:
+            print(f"    {issue.code} | {issue.message}")
+
+    if args.json_out:
+        destination = write_inventory_json(Path(args.json_out), inventory)
+        print(f"Inventory JSON written to: {destination}")
+
+    return 0 if not inventory.failures else 1
+
+
+def _cmd_evidence_inspect(settings: Settings, args: argparse.Namespace) -> int:
+    root = settings.require_dataset()
+    manifest = load_evidence_manifest(root)
+    entry = next(
+        (candidate for candidate in manifest.entries if candidate.file_id == args.file_id),
+        None,
+    )
+    if entry is None:
+        print(f"ERROR: Unknown evidence file_id: {args.file_id}", file=sys.stderr)
+        return 2
+    if not entry.is_supported:
+        print(f"{entry.file_id} is unsupported: {entry.unsupported_reason}")
+        return 1
+
+    parser = parser_for(entry.format)
+    if parser is None:
+        print(f"ERROR: No parser for format {entry.format.value}", file=sys.stderr)
+        return 2
+    outcome = parser.parse(entry, root)
+    if not outcome.recognized:
+        print(f"{entry.file_id} was not recognized: {'; '.join(outcome.warnings)}")
+        return 1
+
+    observations = outcome.observations[: max(0, args.limit)]
+    if args.json:
+        payload = [observation.model_dump(mode="json") for observation in observations]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Evidence file: {entry.file_id} ({entry.file_path})")
+    print(f"  format      : {entry.format.value}")
+    print(f"  captured_at : {entry.captured_at.isoformat()}")
+    print(f"  observations: {len(outcome.observations)}")
+    print(f"  warnings    : {len(outcome.warnings)}")
+    for warning in outcome.warnings[:10]:
+        print(f"    - {warning}")
+    for observation in observations:
+        print(
+            f"  {observation.observation_id} | {observation.system_id or 'UNKNOWN'} | "
+            f"{observation.data_category or 'UNKNOWN'} | "
+            f"{observation.resource_id or 'NO_RESOURCE'} | "
+            f"{observation.observed_state.value} | {observation.captured_at.isoformat()}"
+        )
+        if args.show_identifiers:
+            print(
+                "    identifiers: "
+                f"users={list(observation.user_ids)} "
+                f"emails={list(observation.emails)} "
+                f"phones={list(observation.phones)} "
+                f"hashes={list(observation.email_hashes)}"
+            )
+        else:
+            print(
+                "    identifiers: "
+                f"users={len(observation.user_ids)} "
+                f"emails={len(observation.emails)} "
+                f"phones={len(observation.phones)} "
+                f"hashes={len(observation.email_hashes)} "
+                f"related={len(observation.related_resource_ids)}"
+            )
+        if observation.warnings:
+            print(f"    warnings: {'; '.join(observation.warnings)}")
+    return 0
+
+
+def _cmd_evidence_for_user(settings: Settings, args: argparse.Namespace) -> int:
+    bundle = load_dataset(settings)
+    identity_index = IdentityIndex(bundle.identities, bundle.audit_events)
+    resolver = IdentityResolver(identity_index)
+
+    if args.user_id:
+        identity = identity_index.build_identity(args.user_id)
+    else:
+        if args.email:
+            value, kind = args.email, "email"
+        elif args.phone:
+            value, kind = args.phone, "phone"
+        else:
+            value, kind = args.email_hash, "email_hash"
+        resolution = resolver.resolve_identifier(value, kind)
+        if resolution.status != ResolutionStatus.RESOLVED or resolution.identity is None:
+            print(
+                f"No resolved identity for {value!r}: {resolution.status.value}",
+                file=sys.stderr,
+            )
+            return 1
+        identity = resolution.identity
+
+    try:
+        cutoff = parse_timestamp(args.audit_at) if args.audit_at else None
+    except ValueError as exc:
+        print(f"ERROR: Invalid --audit-at value: {exc}", file=sys.stderr)
+        return 2
+
+    build = build_evidence(settings.require_dataset())
+    evidence_index = EvidenceIndex(build.observations)
+    observations = evidence_index.observations_for_identity(identity, audit_at=cutoff)
+
+    print("Evidence for resolved identity")
+    print(f"  user_id      : {identity.user_id}")
+    print(f"  audit_at     : {cutoff.isoformat() if cutoff else 'none'}")
+    print(f"  observations : {len(observations)}")
+    systems: dict[str, int] = {}
+    categories: dict[str, int] = {}
+    states: dict[str, int] = {}
+    for observation in observations:
+        systems[observation.system_id or "UNKNOWN"] = (
+            systems.get(observation.system_id or "UNKNOWN", 0) + 1
+        )
+        categories[observation.data_category or "UNKNOWN"] = (
+            categories.get(observation.data_category or "UNKNOWN", 0) + 1
+        )
+        states[observation.observed_state.value] = (
+            states.get(observation.observed_state.value, 0) + 1
+        )
+    print("  systems      : " + ", ".join(
+        f"{key}={value}" for key, value in sorted(systems.items())
+    ))
+    print("  categories   : " + ", ".join(
+        f"{key}={value}" for key, value in sorted(categories.items())
+    ))
+    print("  states       : " + ", ".join(
+        f"{key}={value}" for key, value in sorted(states.items())
+    ))
+    print("  sample       :")
+    for observation in observations[: max(0, args.limit)]:
+        print(
+            f"    {observation.resource_id or 'NO_RESOURCE'} | "
+            f"{observation.system_id or 'UNKNOWN'} | "
+            f"{observation.data_category or 'UNKNOWN'} | "
+            f"{observation.observed_state.value} | "
+            f"{observation.captured_at.isoformat()} | {observation.file_id}"
+        )
+    return 0
+
+
+def _mask_email(value: str) -> str:
+    if "@" not in value:
+        return "***"
+    local, domain = value.split("@", 1)
+    return f"{(local[:1] or '*')}***@{domain}"
+
+
+def _cmd_inspect_case(settings: Settings, args: argparse.Namespace) -> int:
+    service = AuditContextService(settings.require_dataset())
+    if args.case_id not in service.case_ids:
+        print(f"ERROR: Unknown case_id: {args.case_id}", file=sys.stderr)
+        return 2
+    source = service.request_source(args.case_id)
+    if args.requests != "all" and source != args.requests:
+        print(
+            f"ERROR: {args.case_id} belongs to the {source!r} request file, "
+            f"not {args.requests!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    context = service.build_context(args.case_id)
+    if args.json_out:
+        destination = write_context_json(Path(args.json_out), context)
+        print(f"Context JSON written to: {destination}")
+
+    print("Audit context")
+    print(f"  case_id        : {context.case_id}")
+    print(f"  audit_at       : {context.audit_at.isoformat()}")
+    print(f"  requested_at   : {context.request.requested_at.isoformat()}")
+    print(f"  reported_at    : {context.request.reported_at.isoformat()}")
+    print(f"  reported_status: {context.request.reported_status.value}")
+    print(f"  request_email  : {_mask_email(context.request.email)}")
+    print(f"  identity       : {context.resolution.status.value}")
+    if context.identity is not None:
+        print(f"    user_id      : {context.identity.user_id}")
+        print(f"    method       : {context.resolution.method.value}")
+        print(
+            "    identifiers  : "
+            f"emails={len(context.identity.all_emails)} "
+            f"phones={len(context.identity.all_phones)} "
+            f"hashes={len(context.identity.all_email_hashes)}"
+        )
+    print(f"  linked_resources: {len(context.linked_resources)}")
+    for link in context.linked_resources[: max(0, args.limit)]:
+        print(
+            f"    {link.resource_id} | systems={list(link.system_ids)} | "
+            f"categories={list(link.data_categories)} | "
+            f"links={[item.value for item in link.link_types]} | "
+            f"confidence={link.confidence:.2f} | verified={link.verified}"
+        )
+    print(f"  states         : {len(context.states)}")
+    for state in context.states[: max(0, args.limit)]:
+        print(
+            f"    {state.resource_id} | {state.kind.value} | {state.state.value} | "
+            f"confidence={state.confidence:.2f} | verified={state.verified} | "
+            f"recreated={state.recreated} | flow={state.active_data_flow} | "
+            f"restore={state.restore_risk}"
+        )
+        for conflict in state.conflicts:
+            print(f"      conflict: {conflict.description} -> {conflict.resolution.value}")
+    print(
+        "  active_data_flows: "
+        + (", ".join(context.active_data_flows) if context.active_data_flows else "none")
+    )
+    print(
+        "  restore_risks    : "
+        + (", ".join(context.restore_risks) if context.restore_risks else "none")
+    )
+    print(f"  conflicts        : {len(context.conflicts)}")
+    for conflict in context.conflicts[: max(0, args.limit)]:
+        print(
+            f"    {conflict.resource_id} | {conflict.description} | "
+            f"states={[item.value for item in conflict.competing_states]} | "
+            f"rule={conflict.rule}"
+        )
+    print(f"  unresolved       : {len(context.unresolved_resources)}")
+    for unresolved in context.unresolved_resources[: max(0, args.limit)]:
+        print(
+            f"    {unresolved.resource_id or 'NO_RESOURCE'} | "
+            f"system={unresolved.system_id or 'UNKNOWN'} | {unresolved.reason}"
+        )
+    print(
+        f"  candidate_activity: {len(context.candidate_activity_resources)}"
+    )
+    for candidate in context.candidate_activity_resources[: max(0, args.limit)]:
+        print(
+            f"    {candidate.resource_id or 'NO_RESOURCE'} | "
+            f"system={candidate.system_id or 'UNKNOWN'} | {candidate.reason}"
+        )
+    print(f"  uncertainties    : {len(context.uncertainties)}")
+    for uncertainty in context.uncertainties[: max(0, args.limit)]:
+        print(f"    - {uncertainty}")
+    print(
+        f"  evidence_considered: {len(context.relevant_observations)} observations, "
+        f"{len(context.relevant_activity)} activity events"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -210,6 +573,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_resolve(settings, args)
         if args.command == "audit-requests":
             return _cmd_audit_requests(settings, args)
+        if args.command == "evidence":
+            if args.evidence_command == "inventory":
+                return _cmd_evidence_inventory(settings, args)
+            if args.evidence_command == "inspect":
+                return _cmd_evidence_inspect(settings, args)
+            if args.evidence_command == "for-user":
+                return _cmd_evidence_for_user(settings, args)
+            parser.error(f"Unknown evidence command: {args.evidence_command}")
+            return 2
+        if args.command == "inspect-case":
+            return _cmd_inspect_case(settings, args)
         parser.error(f"Unknown command: {args.command}")
         return 2
     except PrivacyGuardError as exc:

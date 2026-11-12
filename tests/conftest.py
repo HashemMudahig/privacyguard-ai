@@ -43,6 +43,48 @@ def resolver(identity_index: IdentityIndex) -> IdentityResolver:
     return IdentityResolver(identity_index)
 
 
+@pytest.fixture(scope="session")
+def evidence_build(settings: Settings):
+    from privacyguard.evidence.service import build_evidence
+
+    return build_evidence(settings.dataset_dir)
+
+
+@pytest.fixture(scope="session")
+def activity_index(bundle):
+    from privacyguard.activity.index import ActivityIndex
+
+    return ActivityIndex(bundle.system_activity)
+
+
+@pytest.fixture(scope="session")
+def evidence_index(evidence_build):
+    from privacyguard.evidence.index import EvidenceIndex
+
+    return EvidenceIndex(evidence_build.observations)
+
+
+@pytest.fixture(scope="session")
+def resource_linker(evidence_index, activity_index):
+    from privacyguard.linking.linker import ResourceLinker
+
+    return ResourceLinker(evidence_index, activity_index)
+
+
+@pytest.fixture(scope="session")
+def state_engine(evidence_index, activity_index):
+    from privacyguard.state.engine import StateEngine
+
+    return StateEngine(evidence_index, activity_index)
+
+
+@pytest.fixture(scope="session")
+def audit_service(settings: Settings):
+    from privacyguard.context.service import AuditContextService
+
+    return AuditContextService(settings.dataset_dir)
+
+
 @pytest.fixture()
 def project_tmp_path() -> Path:
     """A temporary directory inside the project, never outside it."""

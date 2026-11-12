@@ -2,9 +2,9 @@
 
 AI-powered personal data deletion auditing agent.
 
-**Current status: Sprint 1 — identity resolution foundation.** This repository
-does **not** yet implement evidence parsing, policy decisions, remediation
-planning, PDF/image extraction, or final `output.csv` generation.
+**Current status: Sprint 2B — temporal state reconstruction and resource
+linking.** This repository does **not** yet implement deletion policy decisions,
+remediation planning, PDF/image extraction, or final `output.csv` generation.
 
 ## What Sprint 1 provides
 
@@ -17,6 +17,108 @@ planning, PDF/image extraction, or final `output.csv` generation.
 - Explicit `AMBIGUOUS` handling. The resolver never guesses a `user_id`.
 - Provenance for every matched identifier and every resolved identity.
 - A CLI, unit tests and integration tests against the real dataset.
+
+## What Sprint 2A provides
+
+- A validated evidence manifest loader (`evidence_files.csv`) with file
+  existence, duplicate-ID, timestamp and path-traversal checks.
+- Deterministic parsers for:
+  - SQLite-compatible SQL snapshots, executed only in an isolated in-memory
+    database with rejected `ATTACH`/`DETACH`/unsafe `PRAGMA` constructs.
+  - JSON snapshot bundles, service exports, record ledgers and collection files.
+  - LOG files in logfmt, pipe, bracket, JSON-lines and nested `message` styles.
+  - TXT handover records.
+- Typed `EvidenceObservation` models with file/capture provenance, source
+  location, explicit observed state, identifiers, related resources and
+  structured record contents.
+- An in-memory evidence index by resource, user, email, phone, hash, related
+  resource, file, system, category and capture time.
+- `audit_at` filtering so evidence captured after a request cutoff is excluded.
+- Explicit reporting of unsupported PDF/PNG files and parser failures.
+
+## What Sprint 2B provides
+
+- A strict loader and typed model for all 4,011 `system_activity.csv` events,
+  including parsed free-text metadata, identifiers, related resources,
+  correlation IDs and explicit state claims.
+- An `ActivityIndex` by resource, related resource, identity, event type,
+  source/target system and time, with `audit_at` filtering.
+- A `ResourceLinker` that connects a resolved identity to resources through:
+  - explicit `user_id` references,
+  - current and historical email/phone/email hash,
+  - related resource references (`source_resource_id`, `ticket_id`,
+    `audit_id`),
+  - shared `trace_id`/`requestId` evidence chains,
+  - explicit activity identity links (`LINK_RESOURCE_IDENTITY`),
+  - activity relationships.
+- Explicit confidence, verification status and provenance on every link.
+- A deterministic `StateEngine` that reconstructs each linked resource's state
+  at `audit_at` (`PRESENT`, `ABSENT`, `REDACTED`, `ANONYMIZED`, `ACTIVE`,
+  `DISABLED`, `BLOCKED`, `UNKNOWN`).
+- Conservative conflict resolution across evidence sources, replicas, activity
+  claims and deletion/recreation chains.
+- A request-level `build_audit_context(case_id)` service that assembles:
+  - request details and resolved identity,
+  - linked resources and unresolved/candidate resources,
+  - resource states, active data-flow candidates and restore risks,
+  - conflicts, uncertainties and full evidence/activity provenance.
+- A CLI `inspect-case` command with optional in-project JSON output.
+
+## Temporal state algorithm
+
+1. Filter evidence observations to `captured_at <= audit_at`.
+2. Filter activity events to `event_time <= audit_at`.
+3. Normalize each observation to an explicit or structurally inferred state.
+   Inference is limited to:
+   - tombstones with no direct identifiers → `REDACTED`,
+   - analytics records with no attributable identifiers → `ANONYMIZED`,
+   - support messages with no direct identifiers → `REDACTED`.
+4. Group observations by source key `(system, category, table)` and keep the
+   latest state-bearing observation per source.
+5. Aggregate sources with conservative precedence:
+   - records: `PRESENT` > `REDACTED` > `ANONYMIZED` > `ABSENT`,
+   - data flows: `ACTIVE` > `DISABLED`,
+   - backups: `ACTIVE` > `BLOCKED`.
+6. Treat activity rows as claims. They become the state only when no evidence
+   state exists, and are marked `verified=False`.
+7. Detect recreation after a successful deletion when a later sync, index,
+   restore, export, cache, email or `PRESENT` observation contradicts it.
+   `CONFIRMED` requires both a later recreation event and later `PRESENT`
+   evidence; a single contradiction is `SUSPECTED`.
+8. Attach a `StateBasis` for every selected observation and activity claim, plus
+   explicit `StateConflict` records for disagreements.
+
+## Resource linking rules
+
+- Never derive `account_id` from `user_id` (for example, `user_10` does not
+  imply `account_010`).
+- Direct evidence links require an explicit identifier match.
+- Related resources require an explicit reference from a linked record.
+- Correlation-chain links require a shared `trace_id`/`requestId` rooted in an
+  observation that already matches the identity.
+- Activity identity links rely on explicit activity metadata and are reported as
+  unverified.
+- Resources in the reported workflow window that cannot be linked are retained
+  as `candidate_activity_resources` with confidence `0.0`; they are not silently
+  promoted to links.
+- Every link carries provenance and a confidence score.
+
+## Conflict-resolution strategy
+
+- Evidence observations override activity claims.
+- Successful deletion followed by `PRESENT` evidence → `PRESENT`, with a
+  recreation conflict.
+- Failed deletion followed by `ABSENT` evidence → `ABSENT`, with a conflict
+  noting the failed claim.
+- Primary `ABSENT` + replica `PRESENT` → `PRESENT`, with a replication-drift
+  conflict.
+- Backup `restore_allowed=true` → restore risk.
+- Active connector evidence → active data-flow candidate.
+- Tombstone with direct identifiers → `PRESENT`, with a tombstone-exposure
+  conflict.
+- Missing evidence is `UNKNOWN`, never `ABSENT`, unless a snapshot scope
+  explicitly proves absence.
+- Every state has either a `StateBasis` or a documented uncertainty.
 
 ## Read-only dataset policy
 
@@ -66,6 +168,24 @@ $env:PYTHONPATH = "src"
 
 # Write an optional JSON report (must stay inside this project)
 & $py -m privacyguard audit-requests --requests sample --json-out reports/identity_sample.json
+
+# Evidence inventory and coverage
+& $py -m privacyguard evidence inventory
+
+# Inspect one parsed evidence file (identifiers are hidden by default)
+& $py -m privacyguard evidence inspect --file-id evidence_03 --limit 5
+
+# Query evidence for a resolved user, optionally with an audit cutoff
+& $py -m privacyguard evidence for-user --email "nadia.ionescu@yahoo.com" --audit-at "2026-09-18T12:25:00Z"
+
+# Write an inventory JSON report (must stay inside this project)
+& $py -m privacyguard evidence inventory --json-out reports/evidence_inventory.json
+
+# Inspect one request case end-to-end
+& $py -m privacyguard inspect-case --case-id case_05 --requests sample
+
+# Write the full audit context JSON (must stay inside this project)
+& $py -m privacyguard inspect-case --case-id case_11 --requests sample --json-out reports/context_case_11.json
 ```
 
 The package also declares a console entry point:
@@ -114,10 +234,74 @@ Identity resolution:
 | Evaluation requests | 518 | 518 | 0 | 0 | 418 | 100 |
 | Combined | 550 | 550 | 0 | 0 | 447 | 103 |
 
+Evidence inventory:
+
+| Item | Count |
+|---|---:|
+| Manifest entries | 94 |
+| Supported entries | 79 |
+| Unsupported entries (PDF/PNG) | 15 |
+| Parsed files | 79 |
+| Parse failures | 0 |
+| Normalized observations | 3,469 |
+| Observations by format | JSON 890, LOG 1,647, SQL 891, TXT 41 |
+| Observations by state | PRESENT 2,116, ABSENT 245, ACTIVE 218, DISABLED 62, BLOCKED 57, ANONYMIZED 12, REDACTED 5, UNKNOWN 754 |
+
+Evidence index:
+
+```text
+observations=3469 files=78 resources=2040 user_ids=440
+emails=781 phones=76 email_hashes=37 systems=15 categories=29
+correlation_ids=994
+earliest_captured_at=2026-01-29T11:44:59Z
+latest_captured_at=2026-10-01T12:00:00Z
+```
+
+`files=78` in the index means files that produced at least one observation.
+`evidence_90` parsed successfully but contains no data observations; it is
+reported as a parse warning, not a failure.
+
+System activity:
+
+```text
+events=4011 resources=3948 event_types=17
+source_systems=11 target_systems=19
+user_identity_links=11 email_identity_links=11
+earliest=2026-01-04T14:56:29Z latest=2026-10-01T10:18:34Z
+```
+
+Sprint 2B sample-case audit contexts (without using `sample_output.csv`):
+
+| Item | Count |
+|---|---:|
+| Sample contexts built | 32 / 32 |
+| Linked resources | 79 |
+| Reconstructed states | 79 |
+| Verified states | 72 |
+| Unverified states | 7 |
+| Contexts with conflicts | 8 |
+| Total conflicts | 12 |
+| Recreated-state detections | 5 (2 CONFIRMED, 3 SUSPECTED) |
+| Active data-flow candidates | 6 |
+| Restore-risk candidates | 3 |
+| Candidate activity resources | 333 |
+| Unresolved linked relationships | 0 |
+| Sample cases with zero direct links | 3 (`case_01`, `case_02`, `case_04`) |
+
+State distribution across the 32 sample contexts:
+
+```text
+PRESENT=48 ABSENT=10 ACTIVE=9 REDACTED=4 BLOCKED=3 DISABLED=3 UNKNOWN=2
+```
+
+A full pass over all 550 requests produced 1,349 linked resources and 1,349
+states with no exceptions; this is a build/quality check, not a classification
+result.
+
 Tests:
 
 ```text
-45 passed
+162 passed (45 Sprint 1 + 63 Sprint 2A + 54 Sprint 2B)
 ```
 
 ## Project layout
@@ -140,10 +324,40 @@ privacyguard-ai/
 │   │   ├── bundle.py
 │   │   ├── csv_loader.py
 │   │   └── types.py
-│   └── identity/
-│       ├── index.py
+│   ├── identity/
+│   │   ├── index.py
+│   │   ├── report.py
+│   │   └── resolver.py
+│   ├── evidence/
+│   │   ├── errors.py
+│   │   ├── identifiers.py
+│   │   ├── index.py
+│   │   ├── manifest.py
+│   │   ├── models.py
+│   │   ├── report.py
+│   │   ├── service.py
+│   │   └── parsers/
+│   │       ├── base.py
+│   │       ├── json_parser.py
+│   │       ├── log.py
+│   │       ├── registry.py
+│   │       ├── sql.py
+│   │       └── txt.py
+│   ├── activity/
+│   │   ├── details.py
+│   │   ├── index.py
+│   │   └── models.py
+│   ├── linking/
+│   │   ├── linker.py
+│   │   └── models.py
+│   ├── state/
+│   │   ├── engine.py
+│   │   └── models.py
+│   └── context/
+│       ├── errors.py
+│       ├── models.py
 │       ├── report.py
-│       └── resolver.py
+│       └── service.py
 └── tests/
     ├── conftest.py
     ├── unit/
@@ -165,19 +379,54 @@ privacyguard-ai/
    from the configured dataset directory.
 6. **The 10 `NOT_APPLICABLE` cases are not classified in this sprint.** Intent
    classification and deletion-status decisions are out of scope.
+7. **Source observations are separate from inferred conclusions.** An explicit
+   `result`, `http_status`, `rows`, `enabled` or `restore_allowed` value may set
+   `observed_state`; other records remain `UNKNOWN` rather than being guessed.
+8. **SQL snapshots are isolated.** They are executed only in a fresh in-memory
+   SQLite connection, and external-attachment or extension-loading constructs
+   are rejected.
+9. **Unsupported formats are explicit.** PDF and PNG entries remain in the
+   manifest but are reported as unsupported with a reason instead of being
+   silently ignored.
+10. **The index never bypasses `audit_at`.** Every query accepts an optional
+    cutoff and filters on the manifest `captured_at` timestamp.
+11. **Activity results are claims.** `reported_result` never becomes a verified
+    state on its own; activity-only states carry `verified=False`.
+12. **No implicit account mapping.** `user_10` never implies `account_010`;
+    links require an explicit identifier, reference or correlation chain.
+13. **Resource links are provenance-backed and confidence-scored.** Correlation
+    chains and activity links are reported as unverified.
+14. **State aggregation is conservative.** A copy that remains `PRESENT` wins
+    over `ABSENT`; a single `ACTIVE` flow or restore path is retained as a risk.
+15. **Missing evidence is not absence.** `UNKNOWN` is used unless a snapshot
+    scope or explicit observation proves otherwise.
 
-## Known limitations (Sprint 1)
+## Known limitations (Sprint 2B)
 
-- No `account_id` inference. The earlier discovery report identified this as
-  the largest unresolved risk; Sprint 1 deliberately does not guess it.
-- No PDF or image parsing (PDF and OCR/vision belong to a later sprint).
-- No policy engine, risk detector, remediation planner, or `output.csv`.
+- No `account_id` inference. Accounts absent from evidence remain candidates,
+  not guessed links.
+- No PDF or image parsing (PDF and OCR/vision belong to Sprint 2C or later).
+  This affects `evidence_58` and the other 14 PDF/PNG files.
+- No policy engine, remediation planner, or `output.csv`.
+- `observed_state=UNKNOWN` remains common in logs that only contain a lookup
+  start or a resource identifier without a completion/status field.
+- `evidence_90` parses successfully but contains no data observations and is
+  reported as a parse warning.
+- Log and SQL records do not always carry a `data_category`; the index keeps
+  them with `UNKNOWN` category rather than inferring one.
+- The reported-workflow-window candidate list is deliberately broad (±2 hours)
+  and contains unrelated activity. It is marked confidence `0.0` and is not a
+  resource link.
+- Activity-only state is provisional (`verified=False`); this is intentional and
+  should be treated as a claim by Sprint 2C.
+- Inferred `REDACTED`/`ANONYMIZED` states are marked `verified=False` and include
+  an uncertainty note.
 - `.env` is not auto-loaded; use PowerShell environment variables or pass CLI
   flags explicitly.
 - The 32 sample requests do not include any `NOT_APPLICABLE` case, so that
   output shape is still untested against real data.
-- Exact row counts in integration tests are tied to the current challenge
-  dataset; if the dataset is regenerated, update the expected counts.
+- Exact row/observation counts in integration tests are tied to the current
+  challenge dataset; if the dataset is regenerated, update the expected counts.
 
 ## Tests
 
@@ -191,10 +440,15 @@ Integration tests skip automatically when the dataset directory is absent and
 
 ## Next sprint
 
-Sprint 2 should add:
+Sprint 2C should add:
 
-1. An evidence index with SQL/JSON/log/text parsers and `captured_at` filtering.
-2. A temporal state engine (`present`, `absent`, `redacted`, `anonymized`,
-   `active`, `disabled`, `blocked`) at `audit_at`.
-3. Calibration of `account_id` linkage against the 32 sample answers.
-4. The deletion policy engine over `deletion_rules.csv`.
+1. The deletion policy engine over `deletion_rules.csv`, consuming
+   `AuditContext.states` and preserving policy-required retained records.
+2. Final `COMPLETE`/`INCOMPLETE`/`NOT_APPLICABLE` classification and ordered
+   `steps_json` remediation/verification planning.
+3. PDF text extraction and image/OCR interfaces for the remaining 15 evidence
+   files.
+4. Calibration of account linkage against the 32 sample answers, without using
+   `sample_output.csv` to create production mappings.
+5. The official output serializer/validator and the requested evaluation and
+   usage reports.
