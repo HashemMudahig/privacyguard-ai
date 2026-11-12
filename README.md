@@ -2,9 +2,9 @@
 
 AI-powered personal data deletion auditing agent.
 
-**Current status: Sprint 2B — temporal state reconstruction and resource
-linking.** This repository does **not** yet implement deletion policy decisions,
-remediation planning, PDF/image extraction, or final `output.csv` generation.
+**Current status: Sprint 2C — policy engine, audit decision and output
+pipeline.** The deterministic end-to-end pipeline now produces validated
+`output.csv` files. PDF/image extraction remains out of scope.
 
 ## What Sprint 1 provides
 
@@ -63,6 +63,32 @@ remediation planning, PDF/image extraction, or final `output.csv` generation.
   - resource states, active data-flow candidates and restore risks,
   - conflicts, uncertainties and full evidence/activity provenance.
 - A CLI `inspect-case` command with optional in-project JSON output.
+
+## What Sprint 2C provides
+
+- A deterministic multilingual request-intent classifier. Non-deletion
+  requests become `NOT_APPLICABLE` with `steps_json=[]`; ambiguous requests are
+  isolated as `UNCERTAIN` and audited conservatively.
+- A typed policy engine loaded from the actual `deletion_rules.csv`, with
+  condition-aware handling for `DELETE`, `REDACT`, `ANONYMIZE`, `RETAIN`,
+  `BLOCK_RESTORE` and `DISABLE_DATA_FLOW`.
+- Corroborated category resolution. Explicit evidence/table categories win;
+  system+resource-prefix hints are lower confidence and are never used alone.
+- Risk findings for active data flows, restore-enabled backups, exposed PII in
+  retained records, and deleted records that still exist.
+- A conservative audit decision engine:
+  - `COMPLETE` only when every linked/covered decision is compliant, required
+    retained records are present, and no recreation/restore/flow risk remains.
+  - `INCOMPLETE` when any violation, unresolved decision, or missing coverage
+    remains.
+  - `NOT_APPLICABLE` only for non-deletion requests.
+- A step planner with the exact allowed phases, operations, states and ordering;
+  remediation/future verification steps use empty evidence IDs.
+- A CSV writer and structural/semantic validator for `case_id`,
+  `deletion_status`, `steps_json`.
+- A sample evaluation harness (status, exact-case, step precision/recall/F1,
+  field, evidence, sequence) and four synthetic end-to-end cases.
+- No LLM calls are used in the production path. Token usage and cost are zero.
 
 ## Temporal state algorithm
 
@@ -186,6 +212,18 @@ $env:PYTHONPATH = "src"
 
 # Write the full audit context JSON (must stay inside this project)
 & $py -m privacyguard inspect-case --case-id case_11 --requests sample --json-out reports/context_case_11.json
+
+# Run the full audit pipeline on the 32 public samples
+& $py -m privacyguard audit-sample
+
+# Run the full audit pipeline on the 518 evaluation requests
+& $py -m privacyguard audit-eval
+
+# Validate a generated output file
+& $py -m privacyguard validate-output --path output.csv --requests eval
+
+# Evaluate sample accuracy against dataset/sample_output.csv
+& $py -m privacyguard evaluate-sample --json-out reports/sample_evaluation.json
 ```
 
 The package also declares a console entry point:
@@ -298,10 +336,43 @@ A full pass over all 550 requests produced 1,349 linked resources and 1,349
 states with no exceptions; this is a build/quality check, not a classification
 result.
 
+Sprint 2C sample evaluation (against `dataset/sample_output.csv`):
+
+| Metric | Actual |
+|---|---:|
+| Status accuracy | 31/32 (0.96875) |
+| Exact case matches | 10/32 (0.3125) |
+| Step precision | 0.9571 |
+| Step recall | 0.8083 |
+| Step F1 | 0.8764 |
+| Field accuracy | 0.8135 |
+| Evidence citation accuracy | 0.9661 |
+| Sequence accuracy | 0.3125 |
+
+Generated status distribution:
+
+```text
+Sample (32):   COMPLETE=9  INCOMPLETE=23  NOT_APPLICABLE=0
+Eval (518):    COMPLETE=143 INCOMPLETE=365 NOT_APPLICABLE=10
+```
+
+Sample status mismatch: `case_04` is expected `COMPLETE` but is classified
+`INCOMPLETE` because no account/analytics resource could be linked without
+inventing an identifier. The remaining exact-step mismatches are missing
+account/analytics/audit verification steps caused by unresolved links, plus one
+support-category choice (`case_10`) where REDACT is used instead of DELETE.
+
+Output validation:
+
+```text
+sample: PASS  rows=32  errors=0
+eval:   PASS  rows=518 errors=0
+```
+
 Tests:
 
 ```text
-162 passed (45 Sprint 1 + 63 Sprint 2A + 54 Sprint 2B)
+205 passed (162 prior sprints + 43 Sprint 2C)
 ```
 
 ## Project layout
@@ -353,15 +424,42 @@ privacyguard-ai/
 │   ├── state/
 │   │   ├── engine.py
 │   │   └── models.py
-│   └── context/
-│       ├── errors.py
-│       ├── models.py
-│       ├── report.py
-│       └── service.py
+│   ├── context/
+│   │   ├── errors.py
+│   │   ├── models.py
+│   │   ├── report.py
+│   │   └── service.py
+│   ├── intent/
+│   │   ├── classifier.py
+│   │   └── models.py
+│   ├── policy/
+│   │   ├── categories.py
+│   │   ├── engine.py
+│   │   ├── models.py
+│   │   └── rules.py
+│   ├── planning/
+│   │   ├── models.py
+│   │   └── planner.py
+│   ├── decision/
+│   │   ├── engine.py
+│   │   └── models.py
+│   ├── output/
+│   │   ├── validator.py
+│   │   └── writer.py
+│   ├── pipeline/
+│   │   └── service.py
+│   └── evaluation/
+│       ├── metrics.py
+│       └── report.py
+├── evaluation/
+│   ├── evaluation_report.md
+│   └── usage_report.md
+├── output.csv
 └── tests/
     ├── conftest.py
     ├── unit/
-    └── integration/
+    ├── integration/
+    └── evaluation/
 ```
 
 ## Design decisions
@@ -377,8 +475,9 @@ privacyguard-ai/
    CSV, 1-based data row, record ID, field and original value.
 5. **No dataset writes.** The loader validates headers strictly and only reads
    from the configured dataset directory.
-6. **The 10 `NOT_APPLICABLE` cases are not classified in this sprint.** Intent
-   classification and deletion-status decisions are out of scope.
+6. **Intent classification is deterministic and multilingual.** Strong
+   non-deletion phrases override deletion words; ambiguous requests are isolated
+   as `UNCERTAIN` and audited conservatively.
 7. **Source observations are separate from inferred conclusions.** An explicit
    `result`, `http_status`, `rows`, `enabled` or `restore_allowed` value may set
    `observed_state`; other records remain `UNKNOWN` rather than being guessed.
@@ -400,14 +499,26 @@ privacyguard-ai/
     over `ABSENT`; a single `ACTIVE` flow or restore path is retained as a risk.
 15. **Missing evidence is not absence.** `UNKNOWN` is used unless a snapshot
     scope or explicit observation proves otherwise.
+16. **Policy categories are never taken from a bare resource prefix.** Prefix
+    hints require a matching system, and explicit evidence/table categories have
+    higher confidence.
+17. **Unknown policy categories do not invent destructive operations.** They
+    produce `UNKNOWN` decisions and prevent a `COMPLETE` classification.
+18. **Account coverage can be provisional.** When exactly one account deletion
+    event exists in the workflow window and no account evidence was linked, a
+    low-confidence coverage decision is used and marked provisional.
+19. **Future remediation/verification never cites evidence.** Only current
+    findings and `COMPLETE` verification steps carry evidence IDs.
+20. **The output validator checks references.** Non-empty evidence IDs must be a
+    known `evidence_*`, `activity_*` or `audit_*` identifier.
 
-## Known limitations (Sprint 2B)
+## Known limitations (Sprint 2C)
 
-- No `account_id` inference. Accounts absent from evidence remain candidates,
-  not guessed links.
-- No PDF or image parsing (PDF and OCR/vision belong to Sprint 2C or later).
-  This affects `evidence_58` and the other 14 PDF/PNG files.
-- No policy engine, remediation planner, or `output.csv`.
+- No `account_id` inference from `user_id`. Accounts absent from evidence remain
+  candidates, not guessed links. This is the main reason for the single sample
+  status mismatch.
+- No PDF or image parsing. This affects `evidence_58` and the other 14 PDF/PNG
+  files, and therefore some support/attachment and marketing evidence.
 - `observed_state=UNKNOWN` remains common in logs that only contain a lookup
   start or a resource identifier without a completion/status field.
 - `evidence_90` parses successfully but contains no data observations and is
@@ -417,14 +528,17 @@ privacyguard-ai/
 - The reported-workflow-window candidate list is deliberately broad (±2 hours)
   and contains unrelated activity. It is marked confidence `0.0` and is not a
   resource link.
-- Activity-only state is provisional (`verified=False`); this is intentional and
-  should be treated as a claim by Sprint 2C.
-- Inferred `REDACTED`/`ANONYMIZED` states are marked `verified=False` and include
-  an uncertainty note.
+- Activity-only and structurally inferred states remain provisional
+  (`verified=False`) and are documented in the audit result.
+- Account/analytics/audit resources that were never linked cannot produce the
+  corresponding verification steps; this reduces step-level recall but not the
+  status decision in most cases.
+- `case_04` remains `INCOMPLETE` because no account/analytics resource can be
+  linked without inventing an identifier; the public answer expects `COMPLETE`.
+- `case_10` uses `REDACT` for a support record where the public answer uses
+  `DELETE`; this is a category/condition ambiguity, not a status error.
 - `.env` is not auto-loaded; use PowerShell environment variables or pass CLI
   flags explicitly.
-- The 32 sample requests do not include any `NOT_APPLICABLE` case, so that
-  output shape is still untested against real data.
 - Exact row/observation counts in integration tests are tied to the current
   challenge dataset; if the dataset is regenerated, update the expected counts.
 
@@ -440,15 +554,17 @@ Integration tests skip automatically when the dataset directory is absent and
 
 ## Next sprint
 
-Sprint 2C should add:
+Sprint 3 / production hardening should add:
 
-1. The deletion policy engine over `deletion_rules.csv`, consuming
-   `AuditContext.states` and preserving policy-required retained records.
-2. Final `COMPLETE`/`INCOMPLETE`/`NOT_APPLICABLE` classification and ordered
-   `steps_json` remediation/verification planning.
-3. PDF text extraction and image/OCR interfaces for the remaining 15 evidence
-   files.
-4. Calibration of account linkage against the 32 sample answers, without using
-   `sample_output.csv` to create production mappings.
-5. The official output serializer/validator and the requested evaluation and
-   usage reports.
+1. PDF text extraction and image/OCR interfaces for the remaining 15 evidence
+   files, with provenance-preserving extraction.
+2. Account-linkage calibration using workflow activity clusters and snapshot
+   scope, without hardcoding sample case IDs or expected account IDs.
+3. Better support-message/attachment condition resolution, especially for
+   replica logs where the record type is not explicit.
+4. Additional synthetic conflict cases for retention, legal holds, and
+   multi-replica drift.
+5. Packaging instructions for the original challenge submission
+   (`code.zip`, `code/evaluation/` copies, and chat transcript) if required.
+6. Optional LLM classification only for requests the deterministic classifier
+   marks `UNCERTAIN`, with structured output, caching, and a token/cost report.

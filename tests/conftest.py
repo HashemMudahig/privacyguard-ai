@@ -102,3 +102,15 @@ def project_tmp_path() -> Path:
         parent = path.parent
         if parent.is_dir() and not any(parent.iterdir()):
             parent.rmdir()
+
+
+@pytest.fixture(scope="session")
+def pipeline(settings: Settings):
+    from privacyguard.pipeline.service import AuditPipeline
+
+    return AuditPipeline(settings.dataset_dir)
+
+
+@pytest.fixture(scope="session")
+def sample_results(pipeline):
+    return pipeline.audit_requests("sample")
