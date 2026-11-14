@@ -16,7 +16,7 @@ from typing import Iterable
 from ..activity.index import ActivityIndex
 from ..activity.models import ReportedResult, SystemActivity
 from ..evidence.index import EvidenceIndex
-from ..evidence.models import EvidenceObservation, ObservedState, coerce_timestamp
+from ..evidence.models import EvidenceFormat, EvidenceObservation, ObservedState, coerce_timestamp
 from ..linking.models import LinkedResource
 from .models import (
     RecreationStatus,
@@ -150,6 +150,47 @@ class StateEngine:
                 latest_claim[0].activity_id,
             ):
                 latest_claim = (event, claim)
+
+        if (
+            evidence_state == ObservedState.PRESENT
+            and latest_claim is not None
+            and latest_claim[1].state in {ObservedState.REDACTED, ObservedState.ANONYMIZED}
+        ):
+            has_direct = any(
+                observation.emails
+                or observation.phones
+                or observation.email_hashes
+                for observation, _ in evidence_latest
+            )
+            has_any = any(
+                observation.user_ids
+                or observation.emails
+                or observation.phones
+                or observation.email_hashes
+                for observation, _ in evidence_latest
+            )
+            target = latest_claim[1].state
+            allowed = (
+                target == ObservedState.REDACTED and not has_direct
+            ) or (
+                target == ObservedState.ANONYMIZED and not has_any
+            )
+            if allowed:
+                evidence_state = target
+                evidence_conf = latest_claim[1].confidence
+                direct_redaction_confirmation = (
+                    target == ObservedState.REDACTED
+                    and any(
+                        _has_explicit_null_support_pii_fields(observation)
+                        for observation, _ in evidence_latest
+                    )
+                )
+                evidence_verified = direct_redaction_confirmation
+                if not direct_redaction_confirmation:
+                    uncertainties.append(
+                        "State is based on successful REDACT/ANONYMIZE activity; "
+                        "evidence contains no direct identifiers"
+                    )
 
         if evidence_state is not None:
             state = evidence_state
@@ -314,29 +355,36 @@ def _effective_observation_state(observation: EvidenceObservation) -> _Effective
     has_any_identifiers = bool(observation.user_ids or has_direct_identifiers)
     tombstone = _is_tombstone(observation)
     analytics = _is_analytics(observation)
+    method = (observation.format == EvidenceFormat.PNG) or (observation.provenance.extraction_method or "").lower().startswith("windows_ocr")
+    confidence = min(0.95, observation.confidence)
+
+    if _is_support_message(observation) and _has_explicit_redaction_marker(observation):
+        return _EffectiveState(
+            ObservedState.REDACTED,
+            "support record contains an explicit redaction marker",
+            confidence,
+            False,
+        )
 
     if tombstone and not has_direct_identifiers:
         if state in {ObservedState.UNKNOWN, ObservedState.PRESENT}:
+            explicit_nulls = _has_explicit_null_identifier_fields(observation)
             return _EffectiveState(
                 ObservedState.REDACTED,
-                "tombstone structure with no direct identifiers",
-                0.9,
-                True,
+                (
+                    "tombstone explicitly stores null direct-identifier fields"
+                    if explicit_nulls
+                    else "tombstone structure with no direct identifiers"
+                ),
+                min(0.9, confidence),
+                not explicit_nulls,
             )
     if analytics and not has_any_identifiers:
         if state in {ObservedState.UNKNOWN, ObservedState.PRESENT}:
             return _EffectiveState(
                 ObservedState.ANONYMIZED,
                 "analytics record with no attributable identifiers",
-                0.85,
-                True,
-            )
-    if _is_support_message(observation) and not has_direct_identifiers:
-        if state in {ObservedState.UNKNOWN, ObservedState.PRESENT}:
-            return _EffectiveState(
-                ObservedState.REDACTED,
-                "support message retained without direct identifiers",
-                0.85,
+                min(0.85, confidence),
                 True,
             )
     if state == ObservedState.UNKNOWN and _record_presence_evidence(
@@ -355,7 +403,45 @@ def _effective_observation_state(observation: EvidenceObservation) -> _Effective
             0.0,
             False,
         )
-    return _EffectiveState(state, observation.state_field or "explicit evidence state", 0.95, False)
+    return _EffectiveState(
+        state,
+        observation.state_field or "explicit evidence state",
+        confidence,
+        method,
+    )
+
+
+def _has_explicit_redaction_marker(observation: EvidenceObservation) -> bool:
+    """Return true only for a literal marker carried by the evidence record."""
+    marker_fields = ("message_text", "message", "body", "content", "text")
+    markers = {"[redacted]", "<redacted>", "redacted"}
+    for field in marker_fields:
+        value = observation.attributes.get(field)
+        if isinstance(value, str) and value.strip().lower() in markers:
+            return True
+    return False
+
+
+def _has_explicit_null_identifier_fields(observation: EvidenceObservation) -> bool:
+    """Require schema-visible nulls; an omitted field is not absence proof."""
+    direct_fields = ("name", "email", "phone")
+    attributes = observation.attributes
+    return all(field in attributes for field in direct_fields) and all(
+        attributes.get(field) in {None, "", "[REDACTED]"}
+        for field in direct_fields
+    )
+
+
+def _has_explicit_null_support_pii_fields(observation: EvidenceObservation) -> bool:
+    """Recognize a support schema that directly exposes all requester PII fields."""
+    if not _is_support_message(observation):
+        return False
+    fields = ("requester_name", "requester_email", "requester_phone")
+    attributes = observation.attributes
+    return all(field in attributes for field in fields) and all(
+        attributes.get(field) in {None, "", "[REDACTED]"}
+        for field in fields
+    )
 
 
 def _record_presence_evidence(
@@ -455,7 +541,9 @@ def _aggregate_evidence(
         confidence = max(0.5, confidence - 0.05 * (len(states) - 1))
     verified = any(not decision.inferred for _, decision in known_selected)
     if not verified:
-        uncertainties.append("State is inferred from evidence structure, not an explicit state field")
+        uncertainties.append(
+            "State is inferred or extracted with low confidence, not a fully verified state field"
+        )
     return known_selected, resolution, confidence, verified
 
 

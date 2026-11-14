@@ -14,15 +14,15 @@ def build_index(evidence_build) -> EvidenceIndex:
 
 def test_index_statistics(evidence_build) -> None:
     stats = build_index(evidence_build).stats()
-    assert stats.observations == 3469
-    assert stats.files == 78
-    assert stats.resources == 2040
-    assert stats.user_ids == 440
-    assert stats.emails == 781
-    assert stats.phones == 76
+    assert stats.observations == 3499
+    assert stats.files == 93
+    assert stats.resources == 2059
+    assert stats.user_ids == 442
+    assert stats.emails == 792
+    assert stats.phones == 79
     assert stats.email_hashes == 37
-    assert stats.systems == 15
-    assert stats.categories == 29
+    assert stats.systems == 18
+    assert stats.categories == 31
     assert stats.correlation_ids == 994
     assert stats.earliest_captured_at is not None
     assert stats.latest_captured_at is not None

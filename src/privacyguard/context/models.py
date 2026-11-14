@@ -7,8 +7,9 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 
 from ..activity.models import SystemActivity
+from ..evidence.coverage import SnapshotAbsenceProof
 from ..evidence.models import EvidenceObservation
-from ..linking.models import LinkedResource, UnresolvedResource
+from ..linking.models import AccountCandidate, LinkedResource, UnresolvedResource
 from ..models import DeletionRequest, IdentityResolution, ResolvedIdentity
 from ..state.models import ResourceState, StateConflict
 
@@ -28,6 +29,8 @@ class AuditContext(BaseModel):
     resolution: IdentityResolution
     identity: ResolvedIdentity | None
     linked_resources: tuple[LinkedResource, ...] = ()
+    account_candidates: tuple[AccountCandidate, ...] = ()
+    absence_proofs: tuple[SnapshotAbsenceProof, ...] = ()
     unresolved_resources: tuple[UnresolvedResource, ...] = ()
     candidate_activity_resources: tuple[UnresolvedResource, ...] = ()
     states: tuple[ResourceState, ...] = ()

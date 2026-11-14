@@ -31,6 +31,9 @@ def make_observation(
     phones: tuple[str, ...] = (),
     email_hashes: tuple[str, ...] = (),
     attributes: dict | None = None,
+    confidence: float = 1.0,
+    extraction_method: str | None = None,
+    evidence_format: EvidenceFormat = EvidenceFormat.JSON,
 ) -> EvidenceObservation:
     moment = parse_timestamp(captured_at)
     return EvidenceObservation(
@@ -39,7 +42,7 @@ def make_observation(
         file_path="evidence/test.json",
         captured_at=moment,
         observed_at=moment,
-        format=EvidenceFormat.JSON,
+        format=evidence_format,
         system_id=system_id,
         resource_id=resource_id,
         data_category=category,
@@ -56,10 +59,11 @@ def make_observation(
             file_id="ev_test",
             file_path="evidence/test.json",
             captured_at=moment,
-            source_format=EvidenceFormat.JSON,
+            source_format=evidence_format,
+            extraction_method=extraction_method,
             location=EvidenceLocation(record_index=1, json_path="records[0]"),
         ),
-        confidence=1.0,
+        confidence=confidence,
         warnings=(),
     )
 
@@ -240,6 +244,82 @@ def test_tombstone_without_direct_identifiers_is_redacted() -> None:
     assert any("inferred" in uncertainty.lower() for uncertainty in state.uncertainties)
 
 
+def test_tombstone_explicit_null_identifier_fields_are_verified_redaction() -> None:
+    state = reconstruct(
+        [
+            make_observation(
+                "obs_tombstone",
+                "2026-01-02T00:00:00Z",
+                resource_id="tombstone_1",
+                state=ObservedState.PRESENT,
+                category="deleted_customer_references",
+                system_id="identity_service",
+                attributes={"name": None, "email": None, "phone": None},
+            )
+        ],
+        [],
+        make_link("tombstone_1", categories=("deleted_customer_references",)),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.REDACTED
+    assert state.verified is True
+
+
+def test_support_literal_redaction_marker_is_direct_verified_evidence() -> None:
+    state = reconstruct(
+        [
+            make_observation(
+                "obs_support",
+                "2026-01-02T00:00:00Z",
+                resource_id="support_1",
+                state=ObservedState.PRESENT,
+                category="SUPPORT_MESSAGE",
+                system_id="support_platform",
+                attributes={"message_text": "[REDACTED]"},
+            )
+        ],
+        [],
+        make_link("support_1", categories=("SUPPORT_MESSAGE",)),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.REDACTED
+    assert state.verified is True
+
+
+def test_support_null_requester_fields_confirm_successful_redaction() -> None:
+    state = reconstruct(
+        [
+            make_observation(
+                "obs_support",
+                "2026-01-02T00:00:00Z",
+                resource_id="support_1",
+                state=ObservedState.PRESENT,
+                category="SUPPORT_MESSAGE",
+                system_id="support_platform",
+                attributes={
+                    "requester_name": None,
+                    "requester_email": None,
+                    "requester_phone": None,
+                    "message_excerpt": "Customer contacted support about an order.",
+                },
+            )
+        ],
+        [
+            make_activity(
+                "activity_redact",
+                "2026-01-02T01:00:00Z",
+                "REDACT_RECORD",
+                resource_id="support_1",
+                target_system="support_platform",
+            )
+        ],
+        make_link("support_1", categories=("SUPPORT_MESSAGE",)),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.REDACTED
+    assert state.verified is True
+
+
 def test_tombstone_with_email_is_present_and_conflicts() -> None:
     state = reconstruct(
         [
@@ -262,7 +342,7 @@ def test_tombstone_with_email_is_present_and_conflicts() -> None:
     assert any("Tombstone" in conflict.description for conflict in state.conflicts)
 
 
-def test_support_message_without_direct_identifiers_is_redacted() -> None:
+def test_support_message_without_direct_identifiers_is_not_assumed_redacted() -> None:
     state = reconstruct(
         [
             make_observation(
@@ -279,7 +359,36 @@ def test_support_message_without_direct_identifiers_is_redacted() -> None:
         make_link("support_1", categories=("SUPPORT_MESSAGE",)),
         "2026-01-03T00:00:00Z",
     )
-    assert state.state == ObservedState.REDACTED
+    assert state.state == ObservedState.PRESENT
+
+
+def test_support_redaction_requires_successful_activity_claim() -> None:
+    observation = make_observation(
+        "obs_support",
+        "2026-01-02T00:00:00Z",
+        resource_id="support_1",
+        state=ObservedState.PRESENT,
+        category="SUPPORT_MESSAGE",
+        system_id="support_platform",
+        user_ids=("user_1",),
+    )
+    link = make_link("support_1", categories=("SUPPORT_MESSAGE",))
+    failed = reconstruct(
+        [observation],
+        [make_activity("activity_1", "2026-01-02T01:00:00Z", "REDACT_RECORD", resource_id="support_1", result="FAILED", target_system="support_platform")],
+        link,
+        "2026-01-03T00:00:00Z",
+    )
+    assert failed.state == ObservedState.PRESENT
+
+    succeeded = reconstruct(
+        [observation],
+        [make_activity("activity_2", "2026-01-02T01:00:00Z", "REDACT_RECORD", resource_id="support_1", target_system="support_platform")],
+        link,
+        "2026-01-03T00:00:00Z",
+    )
+    assert succeeded.state == ObservedState.REDACTED
+    assert succeeded.verified is False
 
 
 def test_activity_only_claim_is_not_verified() -> None:
@@ -431,3 +540,47 @@ def test_started_record_with_identifier_is_not_marked_present() -> None:
         "2026-01-03T00:00:00Z",
     )
     assert state.state == ObservedState.UNKNOWN
+
+
+def test_low_confidence_ocr_state_is_unverified() -> None:
+    state = reconstruct(
+        [
+            make_observation(
+                "obs_ocr",
+                "2026-01-02T00:00:00Z",
+                resource_id="account_1",
+                state=ObservedState.PRESENT,
+                confidence=0.6,
+                extraction_method="windows_ocr",
+                evidence_format=EvidenceFormat.PNG,
+            )
+        ],
+        [],
+        make_link(),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.PRESENT
+    assert state.confidence <= 0.6
+    assert state.verified is False
+    assert state.basis
+
+
+def test_ocr_evidence_after_audit_is_excluded() -> None:
+    state = reconstruct(
+        [
+            make_observation(
+                "obs_ocr",
+                "2026-02-01T00:00:00Z",
+                resource_id="account_1",
+                state=ObservedState.PRESENT,
+                confidence=0.6,
+                extraction_method="windows_ocr",
+                evidence_format=EvidenceFormat.PNG,
+            )
+        ],
+        [],
+        make_link(),
+        "2026-01-15T00:00:00Z",
+    )
+    assert state.state == ObservedState.UNKNOWN
+    assert any("after audit_at" in uncertainty for uncertainty in state.uncertainties)

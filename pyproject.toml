@@ -5,11 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "privacyguard-ai"
 version = "0.1.0"
-description = "AI-powered personal data deletion audit agent (Sprint 1: identity resolution foundation)"
+description = "AI-powered personal data deletion audit agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
+    "pypdf>=7.0",
+    "pillow>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +24,9 @@ privacyguard = "privacyguard.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"privacyguard.evidence.ocr" = ["*.ps1"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

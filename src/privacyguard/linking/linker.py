@@ -13,10 +13,12 @@ from datetime import datetime
 from ..activity.index import ActivityIndex
 from ..activity.models import SystemActivity
 from ..evidence.index import EvidenceIndex
-from ..evidence.models import EvidenceObservation
+from ..evidence.models import EvidenceFormat, EvidenceObservation
 from ..models import ResolvedIdentity
 from ..normalization import normalize
 from .models import (
+    AccountCandidate,
+    LinkLevel,
     LinkProvenance,
     LinkedResource,
     ResourceLinkResult,
@@ -101,6 +103,8 @@ class ResourceLinker:
         identity: ResolvedIdentity,
         *,
         audit_at: datetime | str | None = None,
+        workflow_start: datetime | str | None = None,
+        workflow_end: datetime | str | None = None,
     ) -> ResourceLinkResult:
         accumulators: dict[str, _Accumulator] = {}
         unresolved: list[UnresolvedResource] = []
@@ -125,34 +129,69 @@ class ResourceLinker:
             )
             if link_type is None or not observation.resource_id:
                 continue
+            method = (observation.provenance.extraction_method or "").lower()
+            multimodal = observation.format == EvidenceFormat.PNG or method.startswith("windows_ocr")
+            corroboration_detail: str | None = None
+            if multimodal:
+                corroborated, corroboration_detail = self._ocr_corroboration(
+                    identity, observation, audit_at
+                )
+                if not corroborated:
+                    unresolved.append(
+                        UnresolvedResource(
+                            resource_id=observation.resource_id,
+                            system_id=observation.system_id,
+                            reason=corroboration_detail
+                            or (
+                                "Low-confidence OCR resource ID is not corroborated by "
+                                "text evidence or activity"
+                            ),
+                            observation_ids=(observation.observation_id,),
+                        )
+                    )
+                    continue
             accumulator = self._accumulator(accumulators, observation.resource_id)
-            confidence = _DIRECT_CONFIDENCE[link_type]
+            if multimodal:
+                link_type = ResourceLinkType.MULTIMODAL_INFERRED
+                confidence = 0.6
+                verified = False
+                warning = (
+                    "Linked through low-confidence OCR; verify against corroborating evidence"
+                )
+                if corroboration_detail:
+                    warning = f"{warning} ({corroboration_detail})"
+            else:
+                confidence = _DIRECT_CONFIDENCE[link_type]
+                verified = True
+                warning = None
             accumulator.add(
                 link_type=link_type,
                 confidence=confidence,
-                verified=True,
+                verified=verified,
                 system_id=observation.system_id,
                 data_category=observation.data_category,
                 observation_id=observation.observation_id,
                 provenance=_evidence_provenance(observation, confidence),
+                warning=warning,
             )
             self._check_ambiguity(observation, identity, accumulator, unresolved)
-            for related in observation.related_resource_ids:
-                if related == observation.resource_id:
-                    continue
-                related_acc = self._accumulator(accumulators, related)
-                related_acc.add(
-                    link_type=ResourceLinkType.RELATED_RESOURCE,
-                    confidence=_RELATED_CONFIDENCE,
-                    verified=False,
-                    observation_id=observation.observation_id,
-                    provenance=_evidence_provenance(
-                        observation,
-                        _RELATED_CONFIDENCE,
-                        detail=f"Related resource {related} referenced by {observation.resource_id}",
-                    ),
-                )
-                self._enrich_related(related, audit_at, related_acc)
+            if not multimodal:
+                for related in observation.related_resource_ids:
+                    if related == observation.resource_id:
+                        continue
+                    related_acc = self._accumulator(accumulators, related)
+                    related_acc.add(
+                        link_type=ResourceLinkType.RELATED_RESOURCE,
+                        confidence=_RELATED_CONFIDENCE,
+                        verified=False,
+                        observation_id=observation.observation_id,
+                        provenance=_evidence_provenance(
+                            observation,
+                            _RELATED_CONFIDENCE,
+                            detail=f"Related resource {related} referenced by {observation.resource_id}",
+                        ),
+                    )
+                    self._enrich_related(related, audit_at, related_acc)
 
         for correlation_id in sorted(correlation_ids):
             for observation in self.evidence_index.observations_for_correlation(
@@ -239,6 +278,11 @@ class ResourceLinker:
                         ),
                         confidence=accumulator.confidence,
                         verified=accumulator.verified,
+                        link_level=(
+                            LinkLevel.CONFIRMED
+                            if accumulator.verified
+                            else LinkLevel.INFERRED
+                        ),
                         observation_ids=tuple(accumulator.observation_ids),
                         activity_ids=tuple(accumulator.activity_ids),
                         provenance=tuple(accumulator.provenance),
@@ -255,11 +299,96 @@ class ResourceLinker:
                 accumulators, self.evidence_index, self.activity_index, audit_at
             )
         )
+        candidates = self._account_candidates(
+            workflow_start,
+            workflow_end,
+            audit_at,
+            {resource.resource_id for resource in linked},
+        )
         return ResourceLinkResult(
             linked=linked,
             unresolved=tuple(unresolved),
+            candidates=candidates,
             warnings=tuple(warnings),
         )
+
+    def _account_candidates(
+        self,
+        workflow_start,
+        workflow_end,
+        audit_at,
+        linked_ids: set[str],
+    ) -> tuple[AccountCandidate, ...]:
+        if workflow_start is None or workflow_end is None:
+            return ()
+        events = self.activity_index.events_in_window(
+            workflow_start,
+            workflow_end,
+            event_types={
+                "DELETE_RECORD",
+                "SYNC_RECORD",
+                "INDEX_RECORD",
+                "RESTORE_BACKUP",
+                "REDACT_RECORD",
+                "ANONYMIZE_RECORD",
+                "CHECK_DATA_FLOW",
+                "CHECK_RESTORE_ACCESS",
+            },
+        )
+        grouped: dict[str, list[SystemActivity]] = {}
+        for event in events:
+            if not event.resource_id.startswith("account_"):
+                continue
+            if event.resource_id in linked_ids:
+                continue
+            grouped.setdefault(event.resource_id, []).append(event)
+
+        candidates: list[AccountCandidate] = []
+        for resource_id, resource_events in sorted(grouped.items()):
+            observations = self.evidence_index.observations_for_resource(
+                resource_id, audit_at=audit_at
+            )
+            provenance = [
+                _activity_provenance(event, 0.3) for event in resource_events
+            ]
+            for observation in observations[-2:]:
+                provenance.append(
+                    _evidence_provenance(
+                        observation,
+                        0.4,
+                        detail=f"Supporting evidence for account candidate {resource_id}",
+                    )
+                )
+            reasons = [
+                "Account appears in workflow-window activity without an explicit identity link"
+            ]
+            if observations:
+                reasons.append("At least one evidence observation exists for the candidate account")
+            else:
+                reasons.append("No evidence observation exists for the candidate account")
+            candidates.append(
+                AccountCandidate(
+                    resource_id=resource_id,
+                    system_id=resource_events[0].target_system,
+                    level=LinkLevel.CANDIDATE,
+                    confidence=0.4 if observations else 0.3,
+                    reasons=tuple(reasons),
+                    observation_ids=tuple(
+                        observation.observation_id for observation in observations
+                    ),
+                    activity_ids=tuple(
+                        event.activity_id for event in resource_events
+                    ),
+                    event_types=tuple(
+                        sorted({event.event_type for event in resource_events})
+                    ),
+                    provenance=tuple(provenance),
+                    warnings=(
+                        "CANDIDATE account relationship; not a confirmed identity link",
+                    ),
+                )
+            )
+        return tuple(candidates)
 
     def _accumulator(
         self, accumulators: dict[str, _Accumulator], resource_id: str
@@ -311,6 +440,224 @@ class ResourceLinker:
                     observation_ids=(observation.observation_id,),
                 )
             )
+
+
+    def _ocr_corroboration(
+        self,
+        identity: ResolvedIdentity,
+        observation: EvidenceObservation,
+        audit_at,
+    ) -> tuple[bool, str | None]:
+        resource_id = observation.resource_id
+        if not resource_id:
+            return False, "OCR observation has no resource ID to corroborate"
+        if _ocr_identifier_relation(observation, identity) == "conflict":
+            return (
+                False,
+                "OCR observation mixes identifiers from another identity; "
+                "the OCR resource link was not trusted",
+            )
+
+        neutral: list[str] = []
+        conflicts: list[str] = []
+        for other in self.evidence_index.observations_for_resource(
+            resource_id, audit_at=audit_at
+        ):
+            if other.observation_id == observation.observation_id:
+                continue
+            method = (other.provenance.extraction_method or "").lower()
+            if other.format == EvidenceFormat.PNG or method.startswith("windows_ocr"):
+                continue
+            relation = _identifier_relation(other, identity)
+            if relation == "match":
+                return (
+                    True,
+                    f"text evidence {other.observation_id} independently identifies "
+                    "the same subject",
+                )
+            if relation == "conflict":
+                conflicts.append(f"text evidence {other.observation_id}")
+            else:
+                neutral.append(f"text evidence {other.observation_id}")
+
+        for event in self.activity_index.events_for_resource(
+            resource_id, audit_at=audit_at
+        ):
+            relation = _activity_relation(event, identity)
+            if relation == "match":
+                return (
+                    True,
+                    f"activity {event.activity_id} independently identifies the same subject",
+                )
+            if relation == "conflict":
+                conflicts.append(f"activity {event.activity_id}")
+            else:
+                neutral.append(f"activity {event.activity_id}")
+
+        for related in self.evidence_index.observations_for_identity(
+            identity, audit_at=audit_at, include_resource_neighbors=False
+        ):
+            method = (related.provenance.extraction_method or "").lower()
+            if related.format == EvidenceFormat.PNG or method.startswith("windows_ocr"):
+                continue
+            if resource_id in related.related_resource_ids:
+                return (
+                    True,
+                    f"historical identity evidence {related.observation_id} "
+                    f"references {resource_id}",
+                )
+
+        for event in self.activity_index.events_for_identity(identity, audit_at=audit_at):
+            if resource_id in event.metadata.related_resource_ids:
+                return (
+                    True,
+                    f"historical identity activity {event.activity_id} references {resource_id}",
+                )
+
+        if conflicts and not neutral:
+            return (
+                False,
+                "OCR resource ID is only corroborated by evidence or activity tied to "
+                f"a different identity ({', '.join(conflicts[:2])})",
+            )
+        if conflicts:
+            return (
+                False,
+                "Independent evidence for the OCR resource ID conflicts with the "
+                f"resolved identity ({', '.join(conflicts[:2])})",
+            )
+        if neutral:
+            return (
+                True,
+                "resource ID appears in independent "
+                f"{', '.join(neutral[:2])}, but the subject match relies on OCR",
+            )
+        return (
+            False,
+            "No independent text evidence or activity corroborates this OCR resource ID",
+        )
+
+
+def _identity_sets(identity: ResolvedIdentity) -> tuple[set[str], set[str], set[str], set[str]]:
+    return (
+        {identity.user_id} if identity.user_id else set(),
+        {normalize(email, "email") for email in identity.all_emails},
+        {normalize(phone, "phone") for phone in identity.all_phones},
+        {normalize(email_hash, "email_hash") for email_hash in identity.all_email_hashes},
+    )
+
+
+def _identifier_relation(observation: EvidenceObservation, identity: ResolvedIdentity) -> str:
+    return _relation(
+        set(observation.user_ids),
+        {normalize(email, "email") for email in observation.emails},
+        {normalize(phone, "phone") for phone in observation.phones},
+        {
+            normalize(email_hash, "email_hash")
+            for email_hash in observation.email_hashes
+        },
+        identity,
+    )
+
+
+def _ocr_identifier_relation(
+    observation: EvidenceObservation, identity: ResolvedIdentity
+) -> str:
+    users = set(observation.user_ids)
+    phones = {normalize(phone, "phone") for phone in observation.phones}
+    email_hashes = {
+        normalize(email_hash, "email_hash")
+        for email_hash in observation.email_hashes
+    }
+    identity_users, identity_emails, identity_phones, identity_hashes = _identity_sets(
+        identity
+    )
+    matched_emails: set[str] = set()
+    foreign_emails: set[str] = set()
+    for email in observation.emails:
+        normalized = normalize(email, "email")
+        if normalized in identity_emails or any(
+            _ocr_email_match(normalized, known) for known in identity_emails
+        ):
+            matched_emails.add(normalized)
+        else:
+            foreign_emails.add(normalized)
+    if (
+        not (users or matched_emails or foreign_emails or phones or email_hashes)
+    ):
+        return "neutral"
+    matches = bool(
+        users & identity_users
+        or matched_emails
+        or phones & identity_phones
+        or email_hashes & identity_hashes
+    )
+    foreign = bool(
+        (users - identity_users)
+        or foreign_emails
+        or (phones - identity_phones)
+        or (email_hashes - identity_hashes)
+    )
+    if foreign:
+        return "conflict"
+    return "match" if matches else "neutral"
+
+
+_OCR_CONFUSABLE = frozenset("01il2z8b5s6gq")
+
+
+def _ocr_email_match(value: str, known: str) -> bool:
+    if len(value) != len(known):
+        return False
+    differences = [
+        (left, right)
+        for left, right in zip(value, known, strict=True)
+        if left != right
+    ]
+    if len(differences) != 1:
+        return False
+    left, right = differences[0]
+    return left in _OCR_CONFUSABLE and right in _OCR_CONFUSABLE
+
+
+def _activity_relation(event: SystemActivity, identity: ResolvedIdentity) -> str:
+    metadata = event.metadata
+    return _relation(
+        set(metadata.user_ids),
+        {normalize(email, "email") for email in metadata.emails},
+        {normalize(phone, "phone") for phone in metadata.phones},
+        {normalize(email_hash, "email_hash") for email_hash in metadata.email_hashes},
+        identity,
+    )
+
+
+def _relation(
+    users: set[str],
+    emails: set[str],
+    phones: set[str],
+    email_hashes: set[str],
+    identity: ResolvedIdentity,
+) -> str:
+    if not (users or emails or phones or email_hashes):
+        return "neutral"
+    identity_users, identity_emails, identity_phones, identity_hashes = _identity_sets(
+        identity
+    )
+    matches = bool(
+        users & identity_users
+        or emails & identity_emails
+        or phones & identity_phones
+        or email_hashes & identity_hashes
+    )
+    foreign = bool(
+        (users - identity_users)
+        or (emails - identity_emails)
+        or (phones - identity_phones)
+        or (email_hashes - identity_hashes)
+    )
+    if foreign:
+        return "conflict"
+    return "match" if matches else "neutral"
 
 
 def _classify_observation(

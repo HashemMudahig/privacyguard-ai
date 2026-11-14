@@ -11,6 +11,7 @@ from typing import Sequence
 
 from .config import Settings
 from .decision.models import DeletionStatus
+from .evaluation.comparison import compare_output_files, write_comparison_json
 from .evaluation.report import write_evaluation_json
 from .pipeline import AuditPipeline
 from .context.report import write_context_json
@@ -121,6 +122,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Show raw identifier values. Off by default to avoid unnecessary PII output.",
     )
     inspect.add_argument(
+        "--show-excerpt",
+        action="store_true",
+        help="Show the raw extracted excerpt (may contain personal data).",
+    )
+    inspect.add_argument(
         "--json",
         action="store_true",
         help="Print the full observations as JSON (may contain personal data).",
@@ -204,6 +210,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json-out",
         default=None,
         help="Optional evaluation JSON path inside this project.",
+    )
+    compare_output = subparsers.add_parser(
+        "compare-output", help="Report every per-case change between two output CSV files."
+    )
+    _add_common_options(compare_output)
+    compare_output.add_argument("--before", required=True, help="Baseline output CSV.")
+    compare_output.add_argument("--after", required=True, help="New output CSV.")
+    compare_output.add_argument(
+        "--json-out", required=True, help="Comparison JSON path inside this project."
     )
     return parser
 
@@ -428,6 +443,16 @@ def _cmd_evidence_inspect(settings: Settings, args: argparse.Namespace) -> int:
                 f"hashes={len(observation.email_hashes)} "
                 f"related={len(observation.related_resource_ids)}"
             )
+        location = observation.provenance.location
+        region = location.region
+        print(
+            "    extraction: "
+            f"{observation.provenance.extraction_method or observation.format.value} "
+            f"| page={location.page_number} | region={region} | "
+            f"confidence={observation.confidence:.2f}"
+        )
+        if args.show_excerpt and location.raw_excerpt:
+            print(f"    excerpt: {location.raw_excerpt}")
         if observation.warnings:
             print(f"    warnings: {'; '.join(observation.warnings)}")
     return 0
@@ -650,12 +675,17 @@ def _cmd_evaluate_sample(settings: Settings, args: argparse.Namespace) -> int:
         f"({report.status_accuracy:.4f})\n"
         f"  exact case matches    : {report.exact_case_matches}/{report.total_cases} "
         f"({report.exact_case_accuracy:.4f})\n"
+        f"  exact step-set        : {report.exact_step_set_matches}/{report.total_cases} "
+        f"({report.exact_step_set_accuracy:.4f})\n"
+        f"  exact sequence        : {report.exact_sequence_matches}/{report.total_cases} "
+        f"({report.exact_sequence_accuracy:.4f})\n"
         f"  step precision        : {report.step_precision:.4f}\n"
         f"  step recall           : {report.step_recall:.4f}\n"
         f"  step F1               : {report.step_f1:.4f}\n"
         f"  field accuracy        : {report.field_accuracy:.4f}\n"
         f"  evidence accuracy     : {report.evidence_accuracy:.4f}\n"
-        f"  sequence accuracy     : {report.sequence_accuracy:.4f}"
+        f"  contract validity     : {report.contract_valid_cases}/{report.total_cases} "
+        f"({report.contract_validity_accuracy:.4f})"
     )
     print("  status mismatches:")
     mismatches = [item for item in report.diagnostics if not item.status_correct]
@@ -676,6 +706,20 @@ def _cmd_evaluate_sample(settings: Settings, args: argparse.Namespace) -> int:
     if args.json_out:
         destination = write_evaluation_json(Path(args.json_out), report)
         print(f"Evaluation JSON written to: {destination}")
+    return 0
+
+
+def _cmd_compare_output(settings: Settings, args: argparse.Namespace) -> int:
+    comparison = compare_output_files(args.before, args.after)
+    destination = write_comparison_json(args.json_out, comparison)
+    print("Output comparison")
+    print(f"  before cases : {comparison.before_cases}")
+    print(f"  after cases  : {comparison.after_cases}")
+    print(f"  changed      : {len(comparison.changed_cases)}")
+    print(f"  unchanged    : {comparison.unchanged_cases}")
+    print(f"  added        : {len(comparison.added_case_ids)}")
+    print(f"  removed      : {len(comparison.removed_case_ids)}")
+    print(f"  report       : {destination}")
     return 0
 
 
@@ -713,6 +757,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_validate_output(settings, args)
         if args.command == "evaluate-sample":
             return _cmd_evaluate_sample(settings, args)
+        if args.command == "compare-output":
+            return _cmd_compare_output(settings, args)
         parser.error(f"Unknown command: {args.command}")
         return 2
     except PrivacyGuardError as exc:

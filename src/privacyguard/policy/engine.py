@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Iterable
 
-from ..activity.models import ReportedResult, SystemActivity
+from ..activity.models import SystemActivity
 from ..context.models import AuditContext
 from ..evidence.models import EvidenceObservation, ObservedState
-from ..linking.models import LinkedResource
+from ..linking.models import LinkLevel, LinkedResource
+from ..models import parse_timestamp
 from ..state.models import ResourceState
 from .categories import observations_by_resource, resolve_category
 from .models import (
@@ -66,24 +67,21 @@ class PolicyEngine:
         observations = observations_by_resource(context.relevant_observations)
         links = {link.resource_id: link for link in context.linked_resources}
         activity_systems = _activity_systems_by_resource(context)
+        activity_events = _activity_events_by_resource(context)
         decisions = [
             self._evaluate_resource(
                 state,
                 links.get(state.resource_id),
                 observations.get(state.resource_id, []),
                 activity_systems.get(state.resource_id, set()),
+                activity_events.get(state.resource_id, []),
+                context.audit_at,
             )
             for state in context.states
         ]
 
         coverage_gaps: list[str] = []
-        coverage = self._coverage_decision(context)
-        if coverage is not None:
-            decisions.append(coverage)
-            coverage_gaps.append(
-                "Account resource was linked provisionally from the reported workflow activity"
-            )
-        elif not any(
+        if not any(
             decision.category == PolicyCategory.USER_PROFILE for decision in decisions
         ):
             coverage_gaps.append("No account resource could be linked to the identity")
@@ -106,8 +104,12 @@ class PolicyEngine:
         link: LinkedResource | None,
         observations: list[EvidenceObservation],
         activity_systems: set[str],
+        activity_events: list[SystemActivity],
+        audit_at,
     ) -> PolicyDecision:
-        resolution = resolve_category(state, link, observations, activity_systems)
+        resolution = resolve_category(
+            state, link, observations, activity_systems, activity_events
+        )
         rule = (
             self.rules.for_category(resolution.category.value)
             if resolution.category != PolicyCategory.UNKNOWN
@@ -128,6 +130,7 @@ class PolicyEngine:
                 True,
                 evidence_ids,
                 provisional,
+                link.link_level if link else None,
             )
         if resolution.category == PolicyCategory.BACKUP_ARCHIVE:
             return _build_decision(
@@ -140,6 +143,7 @@ class PolicyEngine:
                 True,
                 evidence_ids,
                 provisional,
+                link.link_level if link else None,
             )
 
         if rule is None:
@@ -150,6 +154,7 @@ class PolicyEngine:
                 category_confidence=resolution.confidence,
                 category_source=resolution.source,
                 status=PolicyDecisionStatus.UNKNOWN,
+                link_level=link.link_level if link else None,
                 observed_state=state.state,
                 reason="No deletion rule could be established for this resource category",
                 evidence_ids=evidence_ids,
@@ -162,7 +167,7 @@ class PolicyEngine:
 
         action = rule.required_action
         condition_met = _condition_met(
-            rule.rule_id, action, state, observations, resolution
+            rule.rule_id, action, state, observations, resolution, audit_at
         )
         return _build_decision(
             state,
@@ -174,76 +179,8 @@ class PolicyEngine:
             condition_met,
             evidence_ids,
             provisional,
+            link.link_level if link else None,
         )
-
-    def _coverage_decision(self, context: AuditContext) -> PolicyDecision | None:
-        if any(state.resource_id.startswith("account_") for state in context.states):
-            return None
-        account_candidates = [
-            candidate
-            for candidate in context.candidate_activity_resources
-            if candidate.resource_id and candidate.resource_id.startswith("account_")
-        ]
-        with_delete_events: list[tuple[str, list[SystemActivity]]] = []
-        for candidate in account_candidates:
-            events = [
-                event
-                for event in context.relevant_activity
-                if event.resource_id == candidate.resource_id
-                and event.event_type == "DELETE_RECORD"
-                and event.target_system == "account_service"
-            ]
-            if events:
-                with_delete_events.append((candidate.resource_id, events))
-        if len(with_delete_events) != 1:
-            return None
-
-        resource_id, events = with_delete_events[0]
-        latest = max(events, key=lambda event: (event.event_time, event.activity_id))
-        observed = (
-            ObservedState.ABSENT
-            if latest.reported_result in {ReportedResult.SUCCESS, ReportedResult.PARTIAL}
-            else ObservedState.PRESENT
-        )
-        status = (
-            PolicyDecisionStatus.COMPLIANT
-            if observed == ObservedState.ABSENT
-            else PolicyDecisionStatus.VIOLATION
-        )
-        return PolicyDecision(
-            resource_id=resource_id,
-            system_id="account_service",
-            category=PolicyCategory.USER_PROFILE,
-            category_confidence=0.6,
-            category_source="activity_coverage",
-            rule_id="rule_01",
-            required_action=PolicyAction.DELETE,
-            condition="Always",
-            condition_met=True,
-            status=status,
-            observed_state=observed,
-            required_final_state=ObservedState.ABSENT,
-            finding_operation=(
-                "REPORT_REMAINING_RECORD" if status == PolicyDecisionStatus.VIOLATION else None
-            ),
-            finding_state=ObservedState.PRESENT if status == PolicyDecisionStatus.VIOLATION else None,
-            remediation_operation=(
-                "DELETE_RECORD" if status == PolicyDecisionStatus.VIOLATION else None
-            ),
-            remediation_state=ObservedState.ABSENT if status == PolicyDecisionStatus.VIOLATION else None,
-            verification_operation="VERIFY_RECORD_ABSENT",
-            verification_state=ObservedState.ABSENT,
-            reason=(
-                "Account deletion coverage inferred from the only account deletion "
-                "event in the reported workflow window; provisional"
-            ),
-            evidence_ids=(latest.activity_id,),
-            provisional=True,
-            uncertainties=(
-                "Account identity is provisional and based on reported activity, not a direct identifier link",
-            ),
-        )
-
 
 _EXPECTED_SYSTEM: dict[PolicyCategory, str] = {
     PolicyCategory.USER_PROFILE: "account_service",
@@ -289,6 +226,7 @@ def _build_decision(
     condition_met: bool | None,
     evidence_ids: tuple[str, ...],
     provisional: bool,
+    link_level: LinkLevel | None = None,
 ) -> PolicyDecision:
     observed = state.state
     base = dict(
@@ -304,11 +242,30 @@ def _build_decision(
         observed_state=observed,
         required_final_state=_ACTION_FINAL_STATE[action],
         evidence_ids=evidence_ids,
+        link_level=link_level,
         provisional=provisional,
         uncertainties=tuple(resolution.warnings),
     )
 
     if action == PolicyAction.RETAIN:
+        if condition_met is False:
+            return PolicyDecision(
+                **base,
+                status=PolicyDecisionStatus.COMPLIANT,
+                reason=(
+                    "The retention period or legal hold is inactive at audit_at; "
+                    "no retention verification is required"
+                ),
+            )
+        if condition_met is None:
+            return PolicyDecision(
+                **base,
+                status=PolicyDecisionStatus.UNKNOWN,
+                reason=(
+                    "The retention period or legal hold applicability could not be "
+                    "established; no verification was invented"
+                ),
+            )
         if observed == ObservedState.ABSENT:
             return PolicyDecision(
                 **base,
@@ -319,7 +276,7 @@ def _build_decision(
                     "A policy-required retained record is absent; no restore operation is defined"
                 ),
             )
-        if observed == ObservedState.PRESENT:
+        if observed == ObservedState.PRESENT and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -332,7 +289,11 @@ def _build_decision(
             status=PolicyDecisionStatus.UNKNOWN,
             verification_operation="VERIFY_RECORD_PRESENT",
             verification_state=ObservedState.PRESENT,
-            reason="Retained record state is unknown",
+            reason=(
+                "Retained record state is unknown"
+                if observed != ObservedState.PRESENT
+                else "Retained record presence is supported only by an unverified activity/inference"
+            ),
         )
 
     if action == PolicyAction.BLOCK_RESTORE:
@@ -348,7 +309,7 @@ def _build_decision(
                 verification_state=ObservedState.BLOCKED,
                 reason="Backup still permits restore of deleted data",
             )
-        if observed == ObservedState.BLOCKED:
+        if observed == ObservedState.BLOCKED and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -385,7 +346,7 @@ def _build_decision(
                 verification_state=ObservedState.DISABLED,
                 reason="An active data flow can recreate or copy the subject's data",
             )
-        if observed == ObservedState.DISABLED:
+        if observed == ObservedState.DISABLED and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -393,7 +354,7 @@ def _build_decision(
                 verification_state=ObservedState.DISABLED,
                 reason="The data flow is disabled",
             )
-        if observed == ObservedState.ABSENT:
+        if observed == ObservedState.ABSENT and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -410,7 +371,7 @@ def _build_decision(
         )
 
     # DELETE / REDACT / ANONYMIZE
-    if observed == ObservedState.ABSENT:
+    if observed == ObservedState.ABSENT and state.verified:
         return PolicyDecision(
             **base,
             status=PolicyDecisionStatus.COMPLIANT,
@@ -418,14 +379,32 @@ def _build_decision(
             verification_state=ObservedState.ABSENT,
             reason="The record is absent",
         )
-    if observed == ObservedState.UNKNOWN:
+    if observed == ObservedState.UNKNOWN or (
+        observed == ObservedState.ABSENT and not state.verified
+    ):
         verification, verification_state = _ACTION_VERIFICATION[action]
         return PolicyDecision(
             **base,
             status=PolicyDecisionStatus.UNKNOWN,
             verification_operation=verification,
             verification_state=verification_state,
-            reason="The record state is unknown; no outcome was invented",
+            reason=(
+                "The record state is unknown; no outcome was invented"
+                if observed == ObservedState.UNKNOWN
+                else "Record absence is supported only by an unverified activity/inference"
+            ),
+        )
+    if not state.verified:
+        verification, verification_state = _ACTION_VERIFICATION[action]
+        return PolicyDecision(
+            **base,
+            status=PolicyDecisionStatus.UNKNOWN,
+            verification_operation=verification,
+            verification_state=verification_state,
+            reason=(
+                "The apparent final record state is supported only by an "
+                "unverified activity or inference"
+            ),
         )
 
     if action == PolicyAction.DELETE:
@@ -449,7 +428,7 @@ def _build_decision(
         )
 
     if action == PolicyAction.REDACT:
-        if observed == ObservedState.REDACTED:
+        if observed == ObservedState.REDACTED and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -457,7 +436,7 @@ def _build_decision(
                 verification_state=ObservedState.REDACTED,
                 reason="Required direct identifiers are redacted",
             )
-        if observed == ObservedState.ANONYMIZED:
+        if observed == ObservedState.ANONYMIZED and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -478,7 +457,7 @@ def _build_decision(
         )
 
     if action == PolicyAction.ANONYMIZE:
-        if observed == ObservedState.ANONYMIZED:
+        if observed == ObservedState.ANONYMIZED and state.verified:
             return PolicyDecision(
                 **base,
                 status=PolicyDecisionStatus.COMPLIANT,
@@ -511,8 +490,19 @@ def _condition_met(
     state: ResourceState,
     observations: list[EvidenceObservation],
     resolution: CategoryResolution,
+    audit_at,
 ) -> bool | None:
-    if rule_id in {"rule_05", "rule_06", "rule_12", "rule_13", "rule_14", "rule_15"}:
+    if rule_id == "rule_13":
+        retain_until = _latest_retention_date(observations)
+        if retain_until is None:
+            return True
+        return audit_at <= retain_until
+    if rule_id == "rule_12":
+        retain_until = _latest_retention_date(observations)
+        if retain_until is None:
+            return True
+        return audit_at <= retain_until
+    if rule_id in {"rule_05", "rule_06", "rule_14", "rule_15"}:
         return True
     if rule_id in {"rule_07", "rule_08"}:
         if state.state == ObservedState.PRESENT:
@@ -527,14 +517,59 @@ def _condition_met(
     return None
 
 
+def _latest_retention_date(observations: list[EvidenceObservation]):
+    values = []
+    for observation in observations:
+        for source in (observation.attributes, observation.record or {}):
+            for key in ("retain_until", "retention_until", "retain_until_date"):
+                value = source.get(key) if isinstance(source, dict) else None
+                if not value:
+                    continue
+                try:
+                    values.append(parse_timestamp(str(value)))
+                except ValueError:
+                    continue
+    return max(values) if values else None
+
+
 def _evidence_ids(state: ResourceState, resolution: CategoryResolution) -> tuple[str, ...]:
-    values: list[str] = list(resolution.evidence_ids)
-    for basis in state.basis:
-        if basis.source_type == "EVIDENCE":
-            values.append(basis.source_id.split(":", 1)[0])
-        else:
-            values.append(basis.source_id)
+    # State evidence supports the asserted observation and therefore outranks
+    # category-only evidence and activity claims. Preserve multiple independent
+    # sources deterministically; the planner uses the first as the citation.
+    matching = [basis for basis in state.basis if basis.state == state.state]
+    other = [basis for basis in state.basis if basis.state != state.state]
+    ordered = sorted(
+        matching,
+        key=lambda basis: (
+            0 if basis.source_type == "EVIDENCE" else 1,
+            -basis.timestamp.timestamp(),
+            basis.source_id,
+        ),
+    )
+    values: list[str] = []
+    for basis in ordered:
+        values.append(
+            basis.source_id.split(":", 1)[0]
+            if basis.source_type == "EVIDENCE"
+            else basis.source_id
+        )
+    values.extend(resolution.evidence_ids)
+    for basis in other:
+        values.append(
+            basis.source_id.split(":", 1)[0]
+            if basis.source_type == "EVIDENCE"
+            else basis.source_id
+        )
     return tuple(dict.fromkeys(value for value in values if value))
+
+
+def _activity_events_by_resource(
+    context: AuditContext,
+) -> dict[str, list[SystemActivity]]:
+    events: dict[str, list[SystemActivity]] = defaultdict(list)
+    for event in context.relevant_activity:
+        events[event.resource_id].append(event)
+    return events
 
 
 def _activity_systems_by_resource(context: AuditContext) -> dict[str, set[str]]:

@@ -10,11 +10,11 @@ from privacyguard.evidence.models import EvidenceFormat, ObservedState
 def test_inventory_counts(evidence_build) -> None:
     inventory = evidence_build.inventory
     assert inventory.total_entries == 94
-    assert inventory.supported_entries == 79
-    assert inventory.unsupported_entries == 15
-    assert inventory.parsed_files == 79
+    assert inventory.supported_entries == 94
+    assert inventory.unsupported_entries == 0
+    assert inventory.parsed_files == 94
     assert inventory.failed_files == 0
-    assert inventory.observation_count == 3469
+    assert inventory.observation_count == 3499
     assert inventory.files_by_format == {
         "json": 28,
         "log": 26,
@@ -26,20 +26,21 @@ def test_inventory_counts(evidence_build) -> None:
     assert inventory.observations_by_format == {
         "json": 890,
         "log": 1647,
+        "pdf": 9,
+        "png": 21,
         "sql": 891,
         "txt": 41,
     }
-    assert inventory.parse_warnings == 1
+    assert inventory.parse_warnings == 17
 
 
-def test_unsupported_formats_are_explicit(evidence_build) -> None:
-    unsupported = evidence_build.inventory.unsupported
-    assert len(unsupported) == 15
-    assert {item.format for item in unsupported} == {
-        EvidenceFormat.PDF,
-        EvidenceFormat.PNG,
+def test_multimodal_formats_are_supported(evidence_build) -> None:
+    assert evidence_build.inventory.unsupported == ()
+    formats = {
+        observation.format for observation in evidence_build.observations
     }
-    assert all(item.reason for item in unsupported)
+    assert EvidenceFormat.PDF in formats
+    assert EvidenceFormat.PNG in formats
 
 
 def test_no_parse_failures(evidence_build) -> None:
@@ -72,6 +73,8 @@ def test_provenance_locations_cover_all_formats(evidence_build) -> None:
         EvidenceFormat.JSON,
         EvidenceFormat.LOG,
         EvidenceFormat.TXT,
+        EvidenceFormat.PDF,
+        EvidenceFormat.PNG,
     }
     for observation in evidence_build.observations:
         location = observation.provenance.location
@@ -84,6 +87,11 @@ def test_provenance_locations_cover_all_formats(evidence_build) -> None:
             assert location.line_number is not None
         elif observation.format == EvidenceFormat.TXT:
             assert location.line_number is not None
+        elif observation.format == EvidenceFormat.PDF:
+            assert location.page_number is not None
+        elif observation.format == EvidenceFormat.PNG:
+            assert observation.provenance.extraction_method == "windows_ocr"
+            assert location.region is not None
 
 
 def test_known_format_samples(evidence_build) -> None:
@@ -127,6 +135,24 @@ def test_known_format_samples(evidence_build) -> None:
     txt = by_file["evidence_03"]
     assert len(txt) == 41
     assert any(observation.observed_state == ObservedState.ABSENT for observation in txt)
+
+    pdf_attachment = by_file["evidence_58"]
+    assert any(
+        observation.resource_id == "support_001"
+        and observation.data_category == "SUPPORT_ATTACHMENT"
+        for observation in pdf_attachment
+    )
+    assert {observation.provenance.location.page_number for observation in pdf_attachment} == {1}
+    legal_pages = {
+        observation.provenance.location.page_number for observation in by_file["evidence_27"]
+    }
+    assert legal_pages == {2}
+    png_account = by_file["evidence_04"]
+    assert any(
+        observation.resource_id == "account_5762"
+        and observation.provenance.extraction_method == "windows_ocr"
+        for observation in png_account
+    )
 
 
 def test_zero_observation_file_is_reported(evidence_build) -> None:

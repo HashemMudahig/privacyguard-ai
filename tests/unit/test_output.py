@@ -52,7 +52,8 @@ def write_rows(target: Path, rows: list[list[str]]) -> None:
 def test_write_and_validate_output(project_tmp_path: Path) -> None:
     target = project_tmp_path / "output.csv"
     write_output([make_result("case_2"), make_result("case_1")], target)
-    rows = list(csv.DictReader(target.open(encoding="utf-8", newline="")))
+    with target.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
     assert [row["case_id"] for row in rows] == ["case_1", "case_2"]
     report = validate_output_file(
         target,
@@ -125,3 +126,31 @@ def test_validation_detects_unknown_evidence(project_tmp_path: Path) -> None:
     )
     assert not report.valid
     assert any("not a known" in error for error in report.errors)
+
+
+def test_validation_rejects_contradictory_operations(project_tmp_path: Path) -> None:
+    target = project_tmp_path / "contradictory.csv"
+    steps = [
+        {
+            "step_no": 1,
+            "phase": "REMEDIATION",
+            "system_id": "account_service",
+            "resource_id": "account_1",
+            "operation": "DELETE_RECORD",
+            "state": "ABSENT",
+            "evidence_id": "",
+        },
+        {
+            "step_no": 2,
+            "phase": "REMEDIATION",
+            "system_id": "account_service",
+            "resource_id": "account_1",
+            "operation": "REDACT_RECORD",
+            "state": "REDACTED",
+            "evidence_id": "",
+        },
+    ]
+    write_rows(target, [["case_1", "INCOMPLETE", json.dumps(steps)]])
+    report = validate_output_file(target, expected_case_ids={"case_1"})
+    assert not report.valid
+    assert any("contradictory" in error for error in report.errors)

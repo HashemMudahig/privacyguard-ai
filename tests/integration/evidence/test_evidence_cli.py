@@ -14,9 +14,9 @@ def test_evidence_inventory_cli(settings, capsys) -> None:
     ) == 0
     output = capsys.readouterr().out
     assert "entries              : 94" in output
-    assert "supported entries    : 79" in output
-    assert "unsupported entries  : 15" in output
-    assert "observations         : 3469" in output
+    assert "supported entries    : 94" in output
+    assert "unsupported entries  : 0" in output
+    assert "observations         : 3499" in output
     assert "parse failures" not in output
 
 
@@ -39,19 +39,38 @@ def test_evidence_inspect_cli(settings, capsys) -> None:
     assert "USER_PROFILE" in output
 
 
-def test_evidence_inspect_unsupported(settings, capsys) -> None:
+def test_evidence_inspect_pdf_and_png(settings, capsys) -> None:
+    assert main(
+        [
+            "evidence",
+            "inspect",
+            "--file-id",
+            "evidence_58",
+            "--limit",
+            "2",
+            "--dataset",
+            str(settings.dataset_dir),
+        ]
+    ) == 0
+    pdf_output = capsys.readouterr().out
+    assert "pypdf_text" in pdf_output
+    assert "support_001" in pdf_output
+
     assert main(
         [
             "evidence",
             "inspect",
             "--file-id",
             "evidence_04",
+            "--limit",
+            "2",
             "--dataset",
             str(settings.dataset_dir),
         ]
-    ) == 1
-    output = capsys.readouterr().out
-    assert "unsupported" in output.lower()
+    ) == 0
+    png_output = capsys.readouterr().out
+    assert "windows_ocr" in png_output
+    assert "account_5762" in png_output
 
 
 def test_evidence_for_user_cli(settings, bundle, capsys) -> None:
@@ -89,7 +108,7 @@ def test_evidence_inventory_json_inside_project(
     assert target.is_file()
     content = target.read_text(encoding="utf-8")
     assert '"total_entries": 94' in content
-    assert '"observation_count": 3469' in content
+    assert '"observation_count": 3499' in content
 
 
 def test_evidence_inventory_refuses_outside_write(settings, capsys) -> None:

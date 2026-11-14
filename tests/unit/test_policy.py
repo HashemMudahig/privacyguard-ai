@@ -6,6 +6,7 @@ from datetime import timezone
 
 import pytest
 
+from privacyguard.activity.models import SystemActivity
 from privacyguard.context.models import AuditContext
 from privacyguard.evidence.models import (
     EvidenceFormat,
@@ -148,6 +149,58 @@ def make_context(
     )
 
 
+def make_legal_observation(
+    resource_id: str,
+    *,
+    retain_until: str | None = None,
+    state: ObservedState = ObservedState.PRESENT,
+) -> EvidenceObservation:
+    moment = parse_timestamp("2026-01-01T00:00:00Z")
+    attributes = {"retain_until": retain_until} if retain_until else {}
+    return EvidenceObservation(
+        observation_id=f"evidence_legal:{resource_id}:00001",
+        file_id="evidence_legal",
+        file_path="evidence/legal_holds.json",
+        captured_at=moment,
+        observed_at=moment,
+        format=EvidenceFormat.JSON,
+        system_id="legal_service",
+        resource_id=resource_id,
+        data_category="LEGAL_HOLD_RECORD",
+        observed_state=state,
+        attributes=attributes,
+        record={"resource_id": resource_id, "record_type": "LEGAL_HOLD_RECORD", **attributes},
+        provenance=EvidenceProvenance(
+            file_id="evidence_legal",
+            file_path="evidence/legal_holds.json",
+            captured_at=moment,
+            source_format=EvidenceFormat.JSON,
+            location=EvidenceLocation(json_path="records[0]"),
+        ),
+    )
+
+
+def make_activity(
+    activity_id: str,
+    resource_id: str,
+    event_type: str,
+    *,
+    target_system: str = "support_platform",
+) -> SystemActivity:
+    return SystemActivity.model_validate(
+        {
+            "activity_id": activity_id,
+            "event_time": "2026-01-01T01:00:00Z",
+            "event_type": event_type,
+            "source_system": "deletion_worker",
+            "target_system": target_system,
+            "resource_id": resource_id,
+            "reported_result": "SUCCESS",
+            "details": "",
+        }
+    )
+
+
 @pytest.fixture(scope="session")
 def rules(settings):
     return load_policy_rules(settings.dataset_dir / "deletion_rules.csv")
@@ -261,6 +314,27 @@ def test_anonymize_present_is_violation(rules) -> None:
     assert decision.remediation_operation == "ANONYMIZE_RECORD"
 
 
+def test_unverified_redact_state_is_unknown_not_compliant(rules) -> None:
+    state = make_state(
+        "support_1", "SUPPORT_MESSAGE", ObservedState.REDACTED, "support_platform",
+        verified=False,
+    )
+    context = make_context([state], [make_link("support_1", "SUPPORT_MESSAGE", "support_platform")])
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.status == PolicyDecisionStatus.UNKNOWN
+    assert decision.finding_operation is None
+    assert decision.remediation_operation is None
+    assert decision.verification_operation == "VERIFY_RECORD_REDACTED"
+
+
+def test_verified_redact_state_is_compliant(rules) -> None:
+    state = make_state("support_1", "SUPPORT_MESSAGE", ObservedState.REDACTED, "support_platform")
+    context = make_context([state], [make_link("support_1", "SUPPORT_MESSAGE", "support_platform")])
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.status == PolicyDecisionStatus.COMPLIANT
+    assert decision.verification_operation == "VERIFY_RECORD_REDACTED"
+
+
 def test_retained_record_is_compliant(rules) -> None:
     state = make_state("audit_record_1", "SECURITY_AUDIT_LOG", ObservedState.PRESENT, "security_service")
     context = make_context(
@@ -303,3 +377,187 @@ def test_unknown_category_is_unknown(rules) -> None:
     assert decision.status == PolicyDecisionStatus.UNKNOWN
     assert decision.finding_operation is None
     assert decision.remediation_operation is None
+
+
+def test_active_legal_hold_requires_presence_verification(rules) -> None:
+    observation = make_legal_observation(
+        "legal_hold_1", retain_until="2026-02-01T00:00:00Z"
+    )
+    state = make_state(
+        "legal_hold_1", "LEGAL_HOLD_RECORD", ObservedState.PRESENT, "legal_service"
+    )
+    context = make_context(
+        [state],
+        [make_link("legal_hold_1", "LEGAL_HOLD_RECORD", "legal_service")],
+        observations=[observation],
+    )
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.condition_met is True
+    assert decision.status == PolicyDecisionStatus.COMPLIANT
+    assert decision.verification_operation == "VERIFY_RECORD_PRESENT"
+
+
+def test_expired_legal_hold_needs_no_verification(rules) -> None:
+    observation = make_legal_observation(
+        "legal_hold_1", retain_until="2025-12-01T00:00:00Z"
+    )
+    state = make_state(
+        "legal_hold_1", "LEGAL_HOLD_RECORD", ObservedState.PRESENT, "legal_service"
+    )
+    context = make_context(
+        [state],
+        [make_link("legal_hold_1", "LEGAL_HOLD_RECORD", "legal_service")],
+        observations=[observation],
+    )
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.condition_met is False
+    assert decision.status == PolicyDecisionStatus.COMPLIANT
+    assert decision.verification_operation is None
+
+
+def test_legal_hold_without_retention_date_is_active_by_presence(rules) -> None:
+    observation = make_legal_observation("legal_hold_1")
+    state = make_state(
+        "legal_hold_1", "LEGAL_HOLD_RECORD", ObservedState.PRESENT, "legal_service"
+    )
+    context = make_context(
+        [state],
+        [make_link("legal_hold_1", "LEGAL_HOLD_RECORD", "legal_service")],
+        observations=[observation],
+    )
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.condition_met is True
+    assert decision.verification_operation == "VERIFY_RECORD_PRESENT"
+
+
+def test_absent_legal_hold_is_a_violation_without_restore(rules) -> None:
+    observation = make_legal_observation(
+        "legal_hold_1", retain_until="2026-02-01T00:00:00Z", state=ObservedState.ABSENT
+    )
+    state = make_state(
+        "legal_hold_1", "LEGAL_HOLD_RECORD", ObservedState.ABSENT, "legal_service"
+    )
+    context = make_context(
+        [state],
+        [make_link("legal_hold_1", "LEGAL_HOLD_RECORD", "legal_service")],
+        observations=[observation],
+    )
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.status == PolicyDecisionStatus.VIOLATION
+    assert decision.remediation_operation is None
+    assert decision.verification_operation == "VERIFY_RECORD_PRESENT"
+
+
+def test_support_redact_activity_does_not_classify_message() -> None:
+    state = make_state("support_9", "UNKNOWN", ObservedState.PRESENT, "support_platform")
+    link = make_link("support_9", "", "support_platform")
+    resolution = resolve_category(
+        state,
+        link,
+        [],
+        {"support_platform"},
+        [make_activity("activity_1", "support_9", "REDACT_RECORD")],
+    )
+    assert resolution.category == PolicyCategory.UNKNOWN
+
+
+def test_support_delete_activity_does_not_classify_attachment() -> None:
+    state = make_state("support_9", "UNKNOWN", ObservedState.PRESENT, "support_platform")
+    link = make_link("support_9", "", "support_platform")
+    resolution = resolve_category(
+        state,
+        link,
+        [],
+        {"support_platform"},
+        [make_activity("activity_1", "support_9", "DELETE_RECORD")],
+    )
+    assert resolution.category == PolicyCategory.UNKNOWN
+
+
+def test_conflicting_support_activities_remain_uncertain() -> None:
+    state = make_state("support_9", "UNKNOWN", ObservedState.PRESENT, "support_platform")
+    link = make_link("support_9", "", "support_platform")
+    resolution = resolve_category(
+        state,
+        link,
+        [],
+        {"support_platform"},
+        [
+            make_activity("activity_2", "support_9", "DELETE_RECORD"),
+            make_activity("activity_1", "support_9", "REDACT_RECORD"),
+        ],
+    )
+    assert resolution.category == PolicyCategory.UNKNOWN
+
+
+def test_support_prefix_alone_is_not_enough() -> None:
+    state = make_state("support_9", "UNKNOWN", ObservedState.PRESENT, "support_platform")
+    link = make_link("support_9", "", "support_platform")
+    resolution = resolve_category(state, link, [], {"support_platform"}, [])
+    assert resolution.category == PolicyCategory.UNKNOWN
+
+
+def test_support_message_event_is_content_evidence() -> None:
+    observation = make_legal_observation("support_9").model_copy(
+        update={
+            "system_id": "support_platform",
+            "data_category": None,
+            "attributes": {"event": "message_pii_scan"},
+            "record": {"event": "message_pii_scan", "detector": "direct_identifier"},
+        }
+    )
+    state = make_state("support_9", "UNKNOWN", ObservedState.PRESENT, "support_platform")
+    resolution = resolve_category(
+        state, make_link("support_9", "", "support_platform"), [observation]
+    )
+    assert resolution.category == PolicyCategory.SUPPORT_MESSAGE
+    assert resolution.source == "content:support_message"
+
+
+def test_category_evidence_excludes_losing_conflicting_category() -> None:
+    state = make_state("object_9", "UNKNOWN", ObservedState.PRESENT, "mixed_service")
+    account = make_legal_observation("object_9")
+    account = account.model_copy(
+        update={
+            "file_id": "evidence_account",
+            "observation_id": "evidence_account:json:1",
+            "data_category": "USER_PROFILE",
+        }
+    )
+    legal = make_legal_observation("object_9")
+    resolution = resolve_category(state, None, [legal, account])
+    assert resolution.category == PolicyCategory.USER_PROFILE
+    assert resolution.evidence_ids == ("evidence_account",)
+
+
+def test_state_evidence_precedes_activity_claim_for_citation(rules) -> None:
+    moment = parse_timestamp("2026-01-01T00:00:00Z")
+    state = make_state(
+        "account_1", "USER_PROFILE", ObservedState.ABSENT, "account_service"
+    ).model_copy(
+        update={
+            "basis": (
+                StateBasis(
+                    source_type="ACTIVITY",
+                    source_id="activity_claim",
+                    timestamp=moment,
+                    state=ObservedState.ABSENT,
+                    detail="delete success claim",
+                    confidence=0.6,
+                ),
+                StateBasis(
+                    source_type="EVIDENCE",
+                    source_id="evidence_direct:sql:1",
+                    timestamp=moment,
+                    state=ObservedState.ABSENT,
+                    detail="authoritative snapshot",
+                    confidence=1.0,
+                ),
+            )
+        }
+    )
+    context = make_context(
+        [state], [make_link("account_1", "USER_PROFILE", "account_service")]
+    )
+    decision = PolicyEngine(rules).evaluate(context).decisions[0]
+    assert decision.evidence_ids[:2] == ("evidence_direct", "activity_claim")

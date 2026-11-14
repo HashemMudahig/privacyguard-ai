@@ -181,6 +181,7 @@ def _validate_steps(
 ) -> None:
     previous_key = None
     seen_steps = set()
+    target_operations: dict[tuple[str, str, str], str] = {}
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             report.errors.append(f"{case_id}: step {index} is not an object")
@@ -227,6 +228,22 @@ def _validate_steps(
         if step_key in seen_steps:
             report.errors.append(f"{case_id}: duplicate step at {index}")
         seen_steps.add(step_key)
+        target_key = (
+            phase,
+            str(step.get("system_id", "")),
+            str(step.get("resource_id", "")),
+        )
+        previous_operation = target_operations.get(target_key)
+        if (
+            phase in {"REMEDIATION", "VERIFICATION"}
+            and previous_operation is not None
+            and previous_operation != operation
+        ):
+            report.errors.append(
+                f"{case_id}: contradictory {phase.lower()} operations for "
+                f"{target_key[1]}/{target_key[2]}: {previous_operation} and {operation}"
+            )
+        target_operations[target_key] = operation
         evidence_id = str(step.get("evidence_id", ""))
         if phase == "FINDING" and not evidence_id:
             report.errors.append(f"{case_id}: finding {index} has no evidence_id")
