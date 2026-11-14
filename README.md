@@ -2,9 +2,11 @@
 
 AI-powered personal data deletion auditing agent.
 
-**Current status: Sprint 2C — policy engine, audit decision and output
-pipeline.** The deterministic end-to-end pipeline now produces validated
-`output.csv` files. PDF/image extraction remains out of scope.
+**Current status: Sprint 3C Correctness Review — final.** The deterministic
+pipeline separates confirmed, inferred and candidate links, verifies redaction
+and absence only from direct evidence (never from an activity claim or a
+partial snapshot), and treats an unresolved account candidate as uncertainty
+rather than a completion blocker.
 
 ## What Sprint 1 provides
 
@@ -90,6 +92,108 @@ pipeline.** The deterministic end-to-end pipeline now produces validated
   field, evidence, sequence) and four synthetic end-to-end cases.
 - No LLM calls are used in the production path. Token usage and cost are zero.
 
+## What Sprint 3A provides
+
+- A PDF parser using local `pypdf` text-layer extraction:
+  - page-level text and page numbers;
+  - resource/user/email/phone/hash/order extraction;
+  - document-type and explicit state detection;
+  - embedded-image warnings;
+  - no OCR fallback when a text layer is sufficient.
+- A PNG parser using the built-in Windows OCR engine through a bundled local
+  PowerShell script:
+  - line- and word-level OCR with bounding boxes;
+  - resource and identifier extraction;
+  - visual-row grouping;
+  - per-observation regions, image dimensions and confidence;
+  - no external service and no paid API.
+- Multimodal evidence integration:
+  - PDF/PNG observations use the existing `EvidenceObservation` model;
+  - the evidence index, temporal filter, resource linker, state engine and
+    policy engine consume them without duplicated logic;
+  - low-confidence OCR links require corroboration by text evidence or activity;
+  - OCR-derived identifiers are never silently promoted to verified identity
+    matches.
+- Explicit reporting of OCR unavailability, unreadable text, missing resource
+  IDs and embedded PDF images.
+- CLI inspection of PDF/PNG evidence via the existing `evidence inspect`
+  command, including extraction method, page, region and confidence.
+
+## What Sprint 3B provides
+
+- Explicit link levels on every resource and policy decision:
+  `CONFIRMED`, `INFERRED`, `CANDIDATE` and `UNRESOLVED`.
+- Workflow-window account candidates (`account_*`) are retained as
+  `CANDIDATE` relationships when the reported activity contains a deletion,
+  sync, index, restore, redact, anonymize or check event. They are never added
+  to `linked_resources` and are never treated as confirmed identity mappings.
+- Coverage decisions for a missing account are marked
+  `link_level=CANDIDATE`, `category_confidence=0.4`, and `provisional=True`.
+- Support message/attachment classification now requires content or activity
+  evidence:
+  - `REDACT_RECORD` activity → `SUPPORT_MESSAGE`,
+  - `DELETE_RECORD` activity → `SUPPORT_ATTACHMENT`,
+  - the bare `support_` prefix is not sufficient.
+- State promotion to `REDACTED`/`ANONYMIZED` now requires a successful
+  redact/anonymize activity claim (or explicit evidence) and no conflicting
+  direct identifiers. A missing identifier is not treated as proof of
+  redaction.
+- Legal holds parse `retain_until` from PDF rows and JSON records. A hold is
+  active only at or before its retention date; expired holds require no
+  verification, and legal-hold records without a date are active by presence.
+- Snapshot coverage model (`evidence/coverage.py`):
+  - SQL replicas, inventory captures, JSON bundles and subject-scoped captures
+    are explicitly non-complete;
+  - absence is `PROVEN` only when a complete snapshot covers the system and
+    collection at or before `audit_at`;
+  - conflicting complete snapshots at the same timestamp are `AMBIGUOUS`.
+- OCR corroboration cross-references OCR resource IDs against:
+  - text evidence for the same resource,
+  - activity for the same resource,
+  - historical identity observations and activity references;
+  - OCR-only identifiers use a narrowly scoped confusable-character match
+    (for example `gmaiI.com`/`gmail.com`) only for identifying the resolved
+    subject; the resource ID itself is never rewritten.
+  Conflicting identifiers from another identity block the OCR link, and every
+  surviving OCR link remains `INFERRED` and `verified=False`.
+
+### Multimodal dependencies
+
+The local environment requires:
+
+```text
+pypdf>=7.0
+pillow>=13.0
+```
+
+PNG OCR also requires Windows 10/11 PowerShell and a Windows OCR language pack.
+On non-Windows systems, PNG files are explicitly reported as OCR-unavailable
+rather than silently skipped.
+
+Local installation:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pip install "pypdf>=7.0" "pillow>=13.0"
+```
+
+### Multimodal CLI examples
+
+```powershell
+$env PYTHONPATH = "src"
+
+# Inspect the delivery attachment PDF
+python -m privacyguard evidence inspect --file-id evidence_58 --limit 3
+
+# Inspect the search console screenshot
+python -m privacyguard evidence inspect --file-id evidence_09 --limit 3
+
+# Show extraction warnings and normalized observations
+python -m privacyguard evidence inspect --file-id evidence_04 --show-excerpt
+
+# Evidence coverage after multimodal parsing
+python -m privacyguard evidence inventory
+```
+
 ## Temporal state algorithm
 
 1. Filter evidence observations to `captured_at <= audit_at`.
@@ -98,7 +202,9 @@ pipeline.** The deterministic end-to-end pipeline now produces validated
    Inference is limited to:
    - tombstones with no direct identifiers → `REDACTED`,
    - analytics records with no attributable identifiers → `ANONYMIZED`,
-   - support messages with no direct identifiers → `REDACTED`.
+   - successful REDACT/ANONYMIZE activity plus evidence with no direct
+     identifiers → `REDACTED`/`ANONYMIZED` (unverified).
+   A support message with no parsed identifiers is **not** assumed redacted.
 4. Group observations by source key `(system, category, table)` and keep the
    latest state-bearing observation per source.
 5. Aggregate sources with conservative precedence:
@@ -124,10 +230,14 @@ pipeline.** The deterministic end-to-end pipeline now produces validated
   observation that already matches the identity.
 - Activity identity links rely on explicit activity metadata and are reported as
   unverified.
-- Resources in the reported workflow window that cannot be linked are retained
-  as `candidate_activity_resources` with confidence `0.0`; they are not silently
-  promoted to links.
-- Every link carries provenance and a confidence score.
+- Account resources that appear only in the reported workflow window are stored
+  as `CANDIDATE` account candidates. Exactly one candidate with an
+  `account_service` deletion event may produce a provisional coverage decision;
+  none of these candidates is a confirmed identity link.
+- OCR resource IDs require independent corroboration. A conflicting identity in
+  text evidence or activity blocks the link; an existence-only corroboration is
+  accepted with a warning that the subject match still depends on OCR.
+- Every link carries provenance, a confidence score and an explicit link level.
 
 ## Conflict-resolution strategy
 
@@ -277,19 +387,19 @@ Evidence inventory:
 | Item | Count |
 |---|---:|
 | Manifest entries | 94 |
-| Supported entries | 79 |
-| Unsupported entries (PDF/PNG) | 15 |
-| Parsed files | 79 |
+| Supported entries | 94 |
+| Unsupported entries | 0 |
+| Parsed files | 94 |
 | Parse failures | 0 |
-| Normalized observations | 3,469 |
-| Observations by format | JSON 890, LOG 1,647, SQL 891, TXT 41 |
-| Observations by state | PRESENT 2,116, ABSENT 245, ACTIVE 218, DISABLED 62, BLOCKED 57, ANONYMIZED 12, REDACTED 5, UNKNOWN 754 |
+| Normalized observations | 3,499 |
+| Observations by format | JSON 890, LOG 1,647, SQL 891, TXT 41, PDF 9, PNG 21 |
+| Observations by state | PRESENT 2,143, ABSENT 245, ACTIVE 227, DISABLED 62, BLOCKED 57, ANONYMIZED 12, REDACTED 6, UNKNOWN 747 |
 
 Evidence index:
 
 ```text
-observations=3469 files=78 resources=2040 user_ids=440
-emails=781 phones=76 email_hashes=37 systems=15 categories=29
+observations=3499 files=93 resources=2059 user_ids=442
+emails=792 phones=79 email_hashes=37 systems=18 categories=31
 correlation_ids=994
 earliest_captured_at=2026-01-29T11:44:59Z
 latest_captured_at=2026-10-01T12:00:00Z
@@ -336,18 +446,25 @@ A full pass over all 550 requests produced 1,349 linked resources and 1,349
 states with no exceptions; this is a build/quality check, not a classification
 result.
 
-Sprint 2C sample evaluation (against `dataset/sample_output.csv`):
+Sprint 3B sample evaluation (against `dataset/sample_output.csv`):
 
-| Metric | Actual |
-|---|---:|
-| Status accuracy | 31/32 (0.96875) |
-| Exact case matches | 10/32 (0.3125) |
-| Step precision | 0.9571 |
-| Step recall | 0.8083 |
-| Step F1 | 0.8764 |
-| Field accuracy | 0.8135 |
-| Evidence citation accuracy | 0.9661 |
-| Sequence accuracy | 0.3125 |
+| Metric | Sprint 2C | Sprint 3A | Sprint 3B |
+|---|---:|---:|---:|
+| Status accuracy | 31/32 (0.96875) | 31/32 (0.96875) | **31/32 (0.96875)** |
+| Exact case matches | 10/32 (0.3125) | 9/32 (0.28125) | **9/32 (0.28125)** |
+| Step precision | 0.9571 | 0.9244 | **0.9419** |
+| Step recall | 0.8083 | 0.8238 | **0.8394** |
+| Step F1 | 0.8764 | 0.8712 | **0.8877** |
+| Field accuracy | 0.8135 | 0.8290 | **0.8446** |
+| Evidence citation accuracy | 0.9661 | 0.9667 | **0.9672** |
+| Sequence accuracy | 0.3125 | 0.28125 | **0.28125** |
+
+Sprint 3B keeps the same status and exact-case counts while improving step
+precision, recall, F1 and field accuracy. The gain comes from activity-backed
+support classification (`case_10`, `case_19`), correct evidence ordering, and
+legal-hold applicability checks. Legal-hold PDF rows still add
+policy-required `VERIFY_RECORD_PRESENT` steps that the public sample answers do
+not include, so exact-step precision remains below Sprint 2C.
 
 Generated status distribution:
 
@@ -357,10 +474,12 @@ Eval (518):    COMPLETE=143 INCOMPLETE=365 NOT_APPLICABLE=10
 ```
 
 Sample status mismatch: `case_04` is expected `COMPLETE` but is classified
-`INCOMPLETE` because no account/analytics resource could be linked without
-inventing an identifier. The remaining exact-step mismatches are missing
-account/analytics/audit verification steps caused by unresolved links, plus one
-support-category choice (`case_10`) where REDACT is used instead of DELETE.
+`INCOMPLETE` because the only account evidence is a partial failover replica
+that does not contain `account_004` and has no explicit complete snapshot
+scope. Treating that replica as proof of absence would violate the snapshot
+coverage rule, so the account stays unresolved. The remaining exact-step
+mismatches are missing account/analytics/audit verification steps caused by
+unresolved links, plus evidence-citation differences that do not change status.
 
 Output validation:
 
@@ -372,7 +491,7 @@ eval:   PASS  rows=518 errors=0
 Tests:
 
 ```text
-205 passed (162 prior sprints + 43 Sprint 2C)
+242 passed (219 prior sprints + 23 Sprint 3B)
 ```
 
 ## Project layout
@@ -400,17 +519,24 @@ privacyguard-ai/
 │   │   ├── report.py
 │   │   └── resolver.py
 │   ├── evidence/
+│   │   ├── coverage.py
 │   │   ├── errors.py
 │   │   ├── identifiers.py
 │   │   ├── index.py
 │   │   ├── manifest.py
 │   │   ├── models.py
+│   │   ├── multimodal.py
 │   │   ├── report.py
 │   │   ├── service.py
+│   │   ├── ocr/
+│   │   │   ├── engine.py
+│   │   │   └── windows_ocr.ps1
 │   │   └── parsers/
 │   │       ├── base.py
+│   │       ├── image.py
 │   │       ├── json_parser.py
 │   │       ├── log.py
+│   │       ├── pdf.py
 │   │       ├── registry.py
 │   │       ├── sql.py
 │   │       └── txt.py
@@ -511,32 +637,48 @@ privacyguard-ai/
     findings and `COMPLETE` verification steps carry evidence IDs.
 20. **The output validator checks references.** Non-empty evidence IDs must be a
     known `evidence_*`, `activity_*` or `audit_*` identifier.
+21. **Candidate is a result, not a link.** Workflow-window account candidates
+    carry `CANDIDATE` and stay outside `linked_resources`; a coverage decision
+    may use one but remains provisional.
+22. **Absence needs a complete scope.** A replica, inventory or JSON bundle that
+    does not declare a complete subject universe can never prove absence.
+23. **Legal holds are date-aware.** An expired `retain_until` makes the hold
+    inactive; a hold with no date is active by presence, not unknown.
+24. **OCR can corroborate but cannot promote.** OCR links stay `INFERRED` and
+    `verified=False`; conflicting identities block them, and OCR resource IDs
+    are never rewritten.
 
-## Known limitations (Sprint 2C)
+## Known limitations (Sprint 3C Correctness Review)
 
-- No `account_id` inference from `user_id`. Accounts absent from evidence remain
-  candidates, not guessed links. This is the main reason for the single sample
-  status mismatch.
-- No PDF or image parsing. This affects `evidence_58` and the other 14 PDF/PNG
-  files, and therefore some support/attachment and marketing evidence.
+- No `account_id` inference from `user_id` and no confirmed link from a bare
+  numeric convention. Accounts absent from evidence remain `CANDIDATE` or
+  unresolved, not guessed links. This is why `case_01`, `case_02` and `case_04`
+  remain `INCOMPLETE` against the public `COMPLETE`.
+- The dataset contains no complete snapshot scope. SQL replicas, the inventory
+  capture and JSON bundles are explicitly non-complete, so absence cannot be
+  proven from any current evidence file.
 - `observed_state=UNKNOWN` remains common in logs that only contain a lookup
   start or a resource identifier without a completion/status field.
 - `evidence_90` parses successfully but contains no data observations and is
   reported as a parse warning.
 - Log and SQL records do not always carry a `data_category`; the index keeps
   them with `UNKNOWN` category rather than inferring one.
-- The reported-workflow-window candidate list is deliberately broad (±2 hours)
-  and contains unrelated activity. It is marked confidence `0.0` and is not a
-  resource link.
-- Activity-only and structurally inferred states remain provisional
+- Workflow-window account candidates are deliberately broad and may include
+  unrelated activity. They are `CANDIDATE`, excluded from linked resources, and
+  never treated as confirmed identity mappings.
+- Activity-only and activity-promoted states remain provisional
   (`verified=False`) and are documented in the audit result.
+- Redaction verification recognizes explicit null identifier fields and literal
+  `[REDACTED]` markers, but not the logfmt string `null` used to serialize
+  nulled requester fields, nor a `[REDACTED]` marker on a log row whose
+  `data_category` is absent. Twelve evaluation support cases therefore remain
+  conservatively `INCOMPLETE`.
 - Account/analytics/audit resources that were never linked cannot produce the
   corresponding verification steps; this reduces step-level recall but not the
   status decision in most cases.
-- `case_04` remains `INCOMPLETE` because no account/analytics resource can be
-  linked without inventing an identifier; the public answer expects `COMPLETE`.
-- `case_10` uses `REDACT` for a support record where the public answer uses
-  `DELETE`; this is a category/condition ambiguity, not a status error.
+- OCR confidence is a fixed conservative value, and OCR text can misread
+  characters. Confusable-character matching is limited to identity comparison;
+  resource IDs are never rewritten or auto-corrected.
 - `.env` is not auto-loaded; use PowerShell environment variables or pass CLI
   flags explicitly.
 - Exact row/observation counts in integration tests are tied to the current
@@ -554,17 +696,92 @@ Integration tests skip automatically when the dataset directory is absent and
 
 ## Next sprint
 
-Sprint 3 / production hardening should add:
+Sprint 4 / production hardening should add:
 
-1. PDF text extraction and image/OCR interfaces for the remaining 15 evidence
-   files, with provenance-preserving extraction.
-2. Account-linkage calibration using workflow activity clusters and snapshot
-   scope, without hardcoding sample case IDs or expected account IDs.
-3. Better support-message/attachment condition resolution, especially for
-   replica logs where the record type is not explicit.
-4. Additional synthetic conflict cases for retention, legal holds, and
-   multi-replica drift.
+1. A snapshot-scope contract from the dataset owner that explicitly declares a
+   complete subject universe, so absence proofs can be used without weakening
+   the current conservative rule.
+2. Account-link calibration that uses independently supplied evidence (for
+   example a complete account snapshot or explicit request-to-account
+   reference), never numeric naming conventions.
+3. Redaction-marker normalization: recognize the logfmt string `null` (nulled
+   requester fields) and a `[REDACTED]` marker on log rows with absent
+   `data_category`, so those support records are verified from direct evidence
+   rather than conservatively left `UNKNOWN`.
+4. Additional synthetic conflict cases for legal holds, multi-replica drift,
+   overlapping workflow windows and same-user multi-case isolation.
 5. Packaging instructions for the original challenge submission
    (`code.zip`, `code/evaluation/` copies, and chat transcript) if required.
 6. Optional LLM classification only for requests the deterministic classifier
    marks `UNCERTAIN`, with structured output, caching, and a token/cost report.
+
+## Sprint 3C: decision accuracy and policy calibration
+
+Sprint 3C deliberately prioritizes evidence validity over public-sample score.
+The baseline was reproduced before edits (`242 passed`, status `31/32`, exact
+case `9/32`, step F1 `0.8877`). The final run has `249 passed`; both the 32-row
+sample and 518-row evaluation outputs pass structural validation.
+
+Two production rules changed:
+
+- workflow-window account candidates are uncertainty only. A deletion activity
+  without an identity link is not proof that the account belongs to the subject
+  and is not proof of absence;
+- support message/attachment policy is derived from record evidence, not from
+  the historical remediation operation. Ambiguous support records remain
+  `UNKNOWN`.
+
+Completeness now requires no policy coverage gap. Consequently, final public
+sample status accuracy is `23/32` and exact-case accuracy is `8/32`; this is a
+measured benchmark regression, not an attempt to optimize the score. Eight
+sample `COMPLETE` answers became `INCOMPLETE` because no subject-linked account
+resource exists. Across the 518 evaluation requests, 94 cases made the same
+transition. No resource identifier was invented to recover those scores.
+
+Evaluation now reports status accuracy, exact step-set accuracy, exact sequence
+accuracy, step precision/recall/F1, six-field accuracy, benchmark citation
+equality, contract validity, structured case diagnostics, and failure taxonomy.
+Use the new comparator to capture status and step-only changes:
+
+```powershell
+$env:PYTHONPATH = "src"
+& ".\.venv\Scripts\python.exe" -m privacyguard compare-output `
+  --before reports/sprint3c_baseline_eval_output.csv `
+  --after reports/sprint3c_eval_output.csv `
+  --json-out reports/sprint3c_eval_comparison.json
+```
+
+Measured Sprint 3C artifacts are under `reports/sprint3c_*`. The detailed Arabic
+engineering report is `reports/sprint3c_final_report_ar.md`.
+
+## Sprint 3C Correctness Review (final)
+
+The correctness review corrected two over-corrections and tightened one
+verification rule:
+
+- the `No account resource could be linked to the identity` gap no longer blocks
+  completion; an unresolved candidate is uncertainty only;
+- a confirmed resource without deletion proof (unknown or unverified absence)
+  still blocks completion;
+- redaction and anonymization are verified only from direct evidence, never from
+  a `REDACT_RECORD`/`ANONYMIZE_RECORD` activity claim alone;
+- absence is proven only by a complete authoritative snapshot.
+
+Final measured state:
+
+```text
+tests                  : 262 passed (with -W error, zero warnings)
+sample status accuracy : 29/32 (0.9062)
+exact case matches     : 8/32 (0.2500)
+step F1                : 0.8571
+field accuracy         : 0.7881
+evidence accuracy      : 0.9483
+contract validity      : 32/32
+eval distribution      : 129 COMPLETE / 379 INCOMPLETE / 10 NOT_APPLICABLE
+```
+
+Remaining sample status mismatches are `case_01`, `case_02` and `case_04`: the
+public answers cite account identifiers (`account_001`, `account_002`,
+`account_004`) that are not attributable from participant-visible evidence, so
+they are not inferred. The final Arabic engineering report is
+`reports/sprint3c_correctness_review_final_ar.md`.

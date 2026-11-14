@@ -41,21 +41,21 @@ def _row(file_id: str, file_path: str, captured_at: str = "2026-01-01T00:00:00Z"
 def test_valid_manifest_and_unsupported_format(project_tmp_path: Path) -> None:
     dataset = _make_dataset(project_tmp_path)
     (dataset / "evidence" / "a.sql").write_text("SELECT 1;", encoding="utf-8")
-    (dataset / "evidence" / "b.png").write_text("not really a png", encoding="utf-8")
+    (dataset / "evidence" / "b.xyz").write_text("unsupported payload", encoding="utf-8")
     _write_manifest(
         dataset,
-        [_row("ev_1", "evidence/a.sql"), _row("ev_2", "evidence/b.png")],
+        [_row("ev_1", "evidence/a.sql"), _row("ev_2", "evidence/b.xyz")],
     )
 
     result = load_evidence_manifest(dataset)
     assert len(result.entries) == 2
     assert result.issues == ()
-    sql_entry, png_entry = result.entries
+    sql_entry, unknown_entry = result.entries
     assert sql_entry.format == EvidenceFormat.SQL
     assert sql_entry.is_supported is True
-    assert png_entry.format == EvidenceFormat.PNG
-    assert png_entry.is_supported is False
-    assert png_entry.unsupported_reason
+    assert unknown_entry.format == EvidenceFormat.UNKNOWN
+    assert unknown_entry.is_supported is False
+    assert unknown_entry.unsupported_reason
     assert sql_entry.captured_at.tzinfo is not None
 
 

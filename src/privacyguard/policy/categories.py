@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from ..activity.models import SystemActivity
 from ..evidence.models import EvidenceObservation
 from ..linking.models import LinkedResource
 from ..state.models import ResourceState
@@ -137,8 +138,10 @@ def resolve_category(
     link: LinkedResource | None,
     observations: Iterable[EvidenceObservation],
     activity_systems: Iterable[str] = (),
+    activity_events: Iterable[SystemActivity] = (),
 ) -> CategoryResolution:
     observation_list = list(observations)
+    activity_event_list = list(activity_events)
     systems = set(state.system_ids)
     if link is not None:
         systems.update(link.system_ids)
@@ -197,7 +200,11 @@ def resolve_category(
                     "content:support_attachment",
                     [observation.file_id],
                 )
-            elif _has_key(record, {"message_text", "message_excerpt", "ticket_id"}) or "support_ticket" in event:
+            elif (
+                _has_key(record, {"message_text", "message_excerpt", "ticket_id"})
+                or "support_ticket" in event
+                or "message_" in event
+            ):
                 add(
                     PolicyCategory.SUPPORT_MESSAGE,
                     0.8,
@@ -218,7 +225,6 @@ def resolve_category(
             ("account_", "account_service", PolicyCategory.USER_PROFILE),
             ("search_", "search_service", PolicyCategory.SEARCH_INDEX_ENTRY),
             ("analytics_", "analytics_platform", PolicyCategory.ANALYTICS_PROFILE),
-            ("support_", "support_platform", PolicyCategory.SUPPORT_MESSAGE),
             ("export_", "export_service", PolicyCategory.USER_EXPORT),
             ("backup_", "backup_service", PolicyCategory.BACKUP_ARCHIVE),
             ("data_flow_", "integration_service", PolicyCategory.DATA_FLOW),
@@ -238,7 +244,6 @@ def resolve_category(
             ("account_", "account_service", PolicyCategory.USER_PROFILE),
             ("search_", "search_service", PolicyCategory.SEARCH_INDEX_ENTRY),
             ("analytics_", "analytics_platform", PolicyCategory.ANALYTICS_PROFILE),
-            ("support_", "support_platform", PolicyCategory.SUPPORT_MESSAGE),
             ("export_", "export_service", PolicyCategory.USER_EXPORT),
             ("backup_", "backup_service", PolicyCategory.BACKUP_ARCHIVE),
             ("data_flow_", "integration_service", PolicyCategory.DATA_FLOW),
@@ -259,7 +264,6 @@ def resolve_category(
             ("account_", "account_service", PolicyCategory.USER_PROFILE),
             ("search_", "search_service", PolicyCategory.SEARCH_INDEX_ENTRY),
             ("analytics_", "analytics_platform", PolicyCategory.ANALYTICS_PROFILE),
-            ("support_", "support_platform", PolicyCategory.SUPPORT_MESSAGE),
             ("export_", "export_service", PolicyCategory.USER_EXPORT),
             ("backup_", "backup_service", PolicyCategory.BACKUP_ARCHIVE),
             ("data_flow_", "integration_service", PolicyCategory.DATA_FLOW),
@@ -293,7 +297,10 @@ def resolve_category(
         )
     )
     best = candidates[0]
-    evidence_ids = tuple(dict.fromkeys(evidence for candidate in candidates for evidence in candidate.evidence_ids))
+    # Only evidence attached to the selected category may support that category.
+    # Aggregating identifiers from losing candidates can cite a source that in
+    # fact supports a conflicting classification.
+    evidence_ids = tuple(dict.fromkeys(best.evidence_ids))
     warnings: list[str] = []
     distinct = {candidate.category for candidate in candidates}
     if len(distinct) > 1:

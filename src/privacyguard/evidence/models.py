@@ -23,7 +23,14 @@ class EvidenceFormat(StrEnum):
 
 
 SUPPORTED_FORMATS: frozenset[EvidenceFormat] = frozenset(
-    {EvidenceFormat.SQL, EvidenceFormat.JSON, EvidenceFormat.LOG, EvidenceFormat.TXT}
+    {
+        EvidenceFormat.SQL,
+        EvidenceFormat.JSON,
+        EvidenceFormat.LOG,
+        EvidenceFormat.TXT,
+        EvidenceFormat.PDF,
+        EvidenceFormat.PNG,
+    }
 )
 
 
@@ -82,8 +89,10 @@ class EvidenceLocation(BaseModel):
     table: str | None = None
     row_number: int | None = None
     line_number: int | None = None
+    page_number: int | None = None
     record_index: int | None = None
     json_path: str | None = None
+    region: dict[str, Any] | None = None
     raw_excerpt: str | None = None
 
 
@@ -96,6 +105,9 @@ class EvidenceProvenance(BaseModel):
     file_path: str
     captured_at: datetime
     source_format: EvidenceFormat
+    extraction_method: str | None = None
+    image_width: int | None = None
+    image_height: int | None = None
     location: EvidenceLocation
 
 

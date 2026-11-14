@@ -6,10 +6,11 @@ from privacyguard.linking.models import ResourceLinkType
 
 
 def request_by_case(bundle, case_id: str):
-    for row in bundle.sample_requests.rows:
-        if row.record.case_id == case_id:
-            return row.record
-    raise AssertionError(f"sample case not found: {case_id}")
+    for request_file in (bundle.sample_requests, bundle.eval_requests):
+        for row in request_file.rows:
+            if row.record.case_id == case_id:
+                return row.record
+    raise AssertionError(f"request case not found: {case_id}")
 
 
 def identity_for(resolver, email: str):
@@ -108,3 +109,39 @@ def test_all_sample_cases_link_without_error(resolver, resource_linker, bundle) 
         result = resource_linker.link(identity, audit_at=request.audit_at)
         total_linked += len(result.linked)
     assert total_linked >= 50
+
+
+def test_multimodal_link_is_unverified(resolver, resource_linker, bundle) -> None:
+    request = request_by_case(bundle, "case_35")
+    identity = identity_for(resolver, request.email)
+    result = resource_linker.link(identity, audit_at=request.audit_at)
+    search = next(resource for resource in result.linked if resource.resource_id == "search_428")
+    assert ResourceLinkType.MULTIMODAL_INFERRED in search.link_types
+    assert search.verified is False
+
+
+def test_uncorroborated_ocr_resource_is_not_linked(resolver, resource_linker, bundle) -> None:
+    request = request_by_case(bundle, "case_35")
+    identity = identity_for(resolver, request.email)
+    result = resource_linker.link(identity, audit_at=request.audit_at)
+    assert "search_42B" not in linked_ids(result)
+    assert any(
+        item.resource_id == "search_42B" for item in result.unresolved
+    )
+
+
+def test_multimodal_does_not_mix_identity_emails(resolver, resource_linker, bundle) -> None:
+    request = request_by_case(bundle, "case_15")
+    identity = identity_for(resolver, request.email)
+    result = resource_linker.link(identity, audit_at=request.audit_at)
+    assert "data_flow_1121" not in linked_ids(result)
+    assert "data_flow_9846" in linked_ids(result)
+
+
+def test_pdf_text_link_is_verified(resolver, resource_linker, bundle) -> None:
+    request = request_by_case(bundle, "case_07")
+    identity = identity_for(resolver, request.email)
+    result = resource_linker.link(identity, audit_at=request.audit_at)
+    support = next(resource for resource in result.linked if resource.resource_id == "support_001")
+    assert support.verified is True
+    assert ResourceLinkType.EMAIL in support.link_types

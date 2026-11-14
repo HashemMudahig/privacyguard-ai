@@ -7,7 +7,10 @@ from pathlib import Path
 
 from ..activity.index import ActivityIndex
 from ..config import Settings
+from ..evidence.coverage import SnapshotAbsenceProof, SnapshotCoverageIndex
+from ..evidence.models import ObservedState
 from ..evidence.index import EvidenceIndex
+from ..evidence.manifest import load_evidence_manifest
 from ..evidence.service import build_evidence
 from ..identity.index import IdentityIndex
 from ..identity.resolver import IdentityResolver
@@ -16,6 +19,7 @@ from ..linking.linker import ResourceLinker
 from ..linking.models import UnresolvedResource
 from ..models import DeletionRequest, ResolutionStatus
 from ..state.engine import StateEngine
+from ..state.models import ResourceKind, ResourceState, StateBasis
 from .errors import AuditContextError
 from .models import AuditContext
 
@@ -38,6 +42,16 @@ _STATE_BEARING_EVENT_TYPES = {
     "CHECK_RESTORE_ACCESS",
 }
 
+_SNAPSHOT_COLLECTION_BY_CATEGORY = {
+    "USER_PROFILE": "customer_profiles",
+    "SEARCH_INDEX_ENTRY": "customer_search_documents",
+    "ANALYTICS_PROFILE": "customer_analytics_profiles",
+    "SUPPORT_MESSAGE": "support_records",
+    "SUPPORT_ATTACHMENT": "support_records",
+    "USER_EXPORT": "customer_exports",
+    "SECURITY_AUDIT_LOG": "security_audit_records",
+}
+
 
 class AuditContextService:
     """Reusable service that builds one audit context per request case."""
@@ -51,6 +65,10 @@ class AuditContextService:
         self.resolver = IdentityResolver(self.identity_index)
         evidence_build = build_evidence(self.dataset_dir)
         self.evidence_index = EvidenceIndex(evidence_build.observations)
+        manifest = load_evidence_manifest(self.dataset_dir)
+        self.snapshot_index = SnapshotCoverageIndex.from_dataset(
+            self.dataset_dir, manifest.entries
+        )
         self.activity_index = ActivityIndex(self.bundle.system_activity)
         self.linker = ResourceLinker(self.evidence_index, self.activity_index)
         self.state_engine = StateEngine(self.evidence_index, self.activity_index)
@@ -102,8 +120,17 @@ class AuditContextService:
                 ),
             )
 
-        link_result = self.linker.link(identity, audit_at=request.audit_at)
+        workflow_start, workflow_end = _workflow_window(request)
+        link_result = self.linker.link(
+            identity,
+            audit_at=request.audit_at,
+            workflow_start=workflow_start,
+            workflow_end=workflow_end,
+        )
         states = self.state_engine.reconstruct(link_result.linked, request.audit_at)
+        states, absence_proofs = apply_authoritative_absence(
+            states, self.snapshot_index, request.audit_at
+        )
 
         linked_ids = {link.resource_id for link in link_result.linked}
         relevant_observations = self._relevant_observations(
@@ -146,6 +173,8 @@ class AuditContextService:
             resolution=resolution,
             identity=identity,
             linked_resources=link_result.linked,
+            account_candidates=link_result.candidates,
+            absence_proofs=absence_proofs,
             unresolved_resources=tuple(unresolved),
             candidate_activity_resources=tuple(candidate_resources),
             states=states,
@@ -240,6 +269,71 @@ def _group_activity_candidates(events) -> list[UnresolvedResource]:
             )
         )
     return unresolved
+
+
+def apply_authoritative_absence(
+    states: tuple[ResourceState, ...],
+    snapshot_index: SnapshotCoverageIndex,
+    audit_at,
+) -> tuple[tuple[ResourceState, ...], tuple[SnapshotAbsenceProof, ...]]:
+    """Upgrade an unverified record state only with complete-snapshot proof.
+
+    Nonappearance in a partial snapshot is not evidence. Confirmed direct
+    observations are already handled by ``StateEngine`` and are not replaced.
+    """
+    resolved: list[ResourceState] = []
+    proofs: list[SnapshotAbsenceProof] = []
+    for state in states:
+        if state.verified or state.kind != ResourceKind.RECORD:
+            resolved.append(state)
+            continue
+        categories = [category.upper() for category in state.data_categories]
+        collections = [
+            _SNAPSHOT_COLLECTION_BY_CATEGORY[category]
+            for category in categories
+            if category in _SNAPSHOT_COLLECTION_BY_CATEGORY
+        ]
+        if not collections:
+            resolved.append(state)
+            continue
+        result = snapshot_index.prove_absence(
+            state.resource_id,
+            system_id=state.system_ids[0] if state.system_ids else None,
+            collection=collections[0],
+            audit_at=audit_at,
+        )
+        proof = result.proof
+        if proof is None:
+            resolved.append(state)
+            continue
+        proofs.append(proof)
+        basis = StateBasis(
+            source_type="EVIDENCE",
+            source_id=proof.file_id,
+            timestamp=proof.captured_at,
+            state=ObservedState.ABSENT,
+            detail=proof.reason,
+            location=proof.provenance,
+            confidence=proof.confidence,
+        )
+        resolved.append(
+            state.model_copy(
+                update={
+                    "state": ObservedState.ABSENT,
+                    "confidence": proof.confidence,
+                    "verified": True,
+                    "basis": (*state.basis, basis),
+                    "evidence_ids": (*state.evidence_ids, proof.file_id),
+                    "uncertainties": tuple(
+                        item
+                        for item in state.uncertainties
+                        if "Missing evidence" not in item
+                    ),
+                    "latest_evidence_at": proof.captured_at,
+                }
+            )
+        )
+    return tuple(resolved), tuple(proofs)
 
 
 def build_audit_context(

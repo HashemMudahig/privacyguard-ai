@@ -62,6 +62,9 @@ class ObservationBuilder:
         observed_at: datetime | str | None = None,
         confidence: float = 1.0,
         warnings: tuple[str, ...] = (),
+        extraction_method: str | None = None,
+        image_width: int | None = None,
+        image_height: int | None = None,
     ) -> EvidenceObservation:
         self._ordinal += 1
         buckets = identifiers or IdentifierBuckets()
@@ -102,6 +105,9 @@ class ObservationBuilder:
                 file_path=self.entry.file_path,
                 captured_at=self.entry.captured_at,
                 source_format=self.source_format,
+                extraction_method=extraction_method,
+                image_width=image_width,
+                image_height=image_height,
                 location=location,
             ),
             confidence=confidence,

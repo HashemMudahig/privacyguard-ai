@@ -7,6 +7,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..evidence.models import ObservedState
+from ..linking.models import LinkLevel
 
 
 class PolicyCategory(StrEnum):
@@ -86,6 +87,7 @@ class PolicyDecision(BaseModel):
     verification_state: ObservedState | None = None
     reason: str
     evidence_ids: tuple[str, ...] = ()
+    link_level: LinkLevel | None = None
     provisional: bool = False
     uncertainties: tuple[str, ...] = ()
 
