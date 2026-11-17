@@ -1,4 +1,4 @@
-# PrivacyGuard AI — Sprint 3C Correctness Review Usage Report
+# PrivacyGuard AI — Sprint 3D Usage Report
 
 ## Summary
 
@@ -47,6 +47,21 @@ INCOMPLETE      25
 NOT_APPLICABLE   0
 Total           32
 ```
+
+Sprint 3D measured sample metrics:
+```text
+status accuracy   : 29/32 (0.9062)
+exact case matches: 8/32 (0.2500)
+step precision    : 0.9512
+step recall       : 0.8083
+step F1           : 0.8739
+field accuracy    : 0.7906
+evidence accuracy : 1.0000
+contract validity : 32/32 (1.0000)
+```
+
+Sprint 3D eval distribution: 140 COMPLETE / 368 INCOMPLETE / 10 NOT_APPLICABLE
+(PASS, 518 rows).
 
 Sample evaluation metrics (against `dataset/sample_output.csv`):
 

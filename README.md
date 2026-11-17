@@ -2,12 +2,13 @@
 
 AI-powered personal data deletion auditing agent.
 
-**Current status: Sprint 3C Correctness Review — final.** The deterministic
-pipeline separates confirmed, inferred and candidate links, verifies redaction
-and absence only from direct evidence (never from an activity claim or a
-partial snapshot), and treats an unresolved account candidate as uncertainty
-rather than a completion blocker.
-
+**Current status: Sprint 3D — evidence normalization and final engine
+hardening (final).** Adds a source-aware null sentinel for explicitly nullable
+identifier fields (so nulled requester fields in a completed support record
+prove field-level redaction), verifies `[REDACTED]` markers served from the
+support platform even without an extracted category, preserves raw field values
+for forensic inspection, and continues to treat activity claims and partial
+snapshots as insufficient.
 ## What Sprint 1 provides
 
 - A strict CSV loader for the read-only challenge dataset.
@@ -683,6 +684,27 @@ privacyguard-ai/
   flags explicitly.
 - Exact row/observation counts in integration tests are tied to the current
   challenge dataset; if the dataset is regenerated, update the expected counts.
+
+## SmartShop synthetic test environment (Sprint 4A)
+
+SmartShop is a dedicated synthetic business dataset for validating PrivacyGuard
+AI against PostgreSQL-backed e-commerce records. It includes a SQL schema, a
+deterministic seed (fixed `FIXED_SEED = 0xA1B2C3D4`), six core verification
+scenarios, and a database-name safety guard.
+
+Package: `privacyguard.smartshop`
+
+- `schema.sql` — isolated `smartshop` schema with constraints, indexes and
+  timestamps.
+- `db.py` — connection helpers that refuse any database whose name does not
+  start with `smartshop_` unless `SMARTSHOP_TEST_MODE=1`.
+- `seed.py` — deterministic, fully fictional customer and record generation.
+
+Tests: `tests/smartshop/test_smartshop.py` (run without a live database).
+
+Live PostgreSQL integration is optional: set `SMARTSHOP_PG_*` variables in a
+local `.env` (see `.env.example`) with a dedicated `smartshop_*` database.
+No real personal data is used.
 
 ## Tests
 

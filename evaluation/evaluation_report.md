@@ -1,4 +1,4 @@
-# PrivacyGuard AI — Evaluation Report (Sprint 3C Correctness Review Final)
+# PrivacyGuard AI — Evaluation Report (Sprint 3D Final)
 
 ## Scope
 
@@ -382,3 +382,65 @@ links resources that cannot always be attributed from participant-visible data;
 for example, `case_04` has no reliable link to `account_004` or
 `analytics_901`, and `evidence_54` does not contain `account_001` or
 `account_002`. Those identifiers are not promoted from timing coincidence.
+
+## Sprint 3D update — evidence normalization finalization
+
+Test suite after Sprint 3D:
+
+```text
+266 passed in 29.22s (with -W error, zero warnings)
+```
+
+### Normalization change
+Support records with `requester_name`/`requester_email`/`requester_phone` all explicitly
+present (regardless of whether the value is Python `None`, an empty string, a literal
+`[REDACTED]`, or the logfmt/JSON sentinel `null`) are treated as directly verified
+`REDACTED` when the rest of the record is coherent. A `[REDACTED]` `message_text` on a
+record served by `support_platform` is also treated as a verified redaction marker,
+even if the parser could not extract a `data_category`.
+
+### Metrics before and after
+
+| Metric | Sprint 3C Correctness Review | Sprint 3D |
+|---|---:|---:|
+| Tests | 262 passed | **266 passed** |
+| Status accuracy | 29/32 (0.9062) | **29/32 (0.9062)** |
+| Exact case matches | 8/32 (0.2500) | **8/32 (0.2500)** |
+| Step precision | 0.9329 | **0.9512** |
+| Step recall | 0.7927 | **0.8083** |
+| Step F1 | 0.8571 | **0.8739** |
+| Field accuracy | 0.7881 | **0.7906** |
+| Evidence accuracy | 0.9483 | **1.0000** |
+| Output contract | 32/32 | **32/32** |
+
+Evaluation distribution:
+
+```text
+Sprint 3C Correctness Review: 129 COMPLETE / 379 INCOMPLETE / 10 NOT_APPLICABLE
+Sprint 3D:                   140 COMPLETE / 368 INCOMPLETE / 10 NOT_APPLICABLE
+```
+
+Output validation: sample PASS (32 rows), eval PASS (518 rows).
+
+### Improved cases
+Eleven evaluation cases newly became `COMPLETE` through the redaction normalization:
+`case_44`, `case_51`, `case_77`, `case_81`, `case_82`, `case_233`, `case_235`,
+`case_292`, `case_324`, `case_326`, `case_331`. `case_264` remains
+`INCOMPLETE` because another resource (a backup) is unverified.
+
+### Step/evidence changes versus Sprint 3C Correctness Review
+- 24 evaluation cases changed in total; of them 13 had step-set changes with no
+  status change (mostly evidence-citation consolidation, first non-empty basis
+  only), 11 flipped INCOMPLETE to COMPLETE.
+- Sample: 6 cases changed, all INCOMPLETE to COMPLETE, no golden-comparison
+  change in status count (still 29/32).
+
+### Still unresolved
+- `case_01`, `case_02`, `case_04` remain `INCOMPLETE` versus public `COMPLETE`
+  because the cited account identifiers are not attributable from participant
+  data.
+- Eleven of the original twelve redaction cases are now verified; `case_264`
+  keeps `UNKNOWN` on a backup resource.
+- Logfmt literal string `"null"` (nulled requester fields) is now recognized as
+  a field-eligible null sentinel, but other source formats keep their own
+  semantics. Other `null`-bearing fields are reported as ordinary values.

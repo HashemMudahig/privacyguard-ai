@@ -584,3 +584,96 @@ def test_ocr_evidence_after_audit_is_excluded() -> None:
     )
     assert state.state == ObservedState.UNKNOWN
     assert any("after audit_at" in uncertainty for uncertainty in state.uncertainties)
+
+
+def test_support_null_requester_field_strings_are_verified_redaction() -> None:
+    observation = make_observation(
+        "obs_support",
+        "2026-01-02T00:00:00Z",
+        resource_id="support_1",
+        state=ObservedState.PRESENT,
+        category="SUPPORT_MESSAGE",
+        system_id="support_platform",
+        attributes={
+            "requester_name": "null",
+            "requester_email": "null",
+            "requester_phone": "null",
+            "message_excerpt": "Customer contacted support about an order.",
+        },
+    )
+    state = reconstruct(
+        [observation],
+        [make_activity("activity_1", "2026-01-02T01:00:00Z", "REDACT_RECORD", resource_id="support_1", target_system="support_platform")],
+        make_link("support_1", categories=("SUPPORT_MESSAGE",)),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.REDACTED
+    assert state.verified is True
+
+
+def test_support_null_requester_fields_require_all_three_fields() -> None:
+    observation = make_observation(
+        "obs_support",
+        "2026-01-02T00:00:00Z",
+        resource_id="support_1",
+        state=ObservedState.PRESENT,
+        category="SUPPORT_MESSAGE",
+        system_id="support_platform",
+        attributes={"requester_email": "null", "requester_phone": "null"},
+    )
+    state = reconstruct(
+        [observation],
+        [make_activity("activity_1", "2026-01-02T01:00:00Z", "REDACT_RECORD", resource_id="support_1", target_system="support_platform")],
+        make_link("support_1", categories=("SUPPORT_MESSAGE",)),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.REDACTED
+    assert state.verified is False
+
+
+def test_ordinary_null_text_is_not_a_redaction_marker() -> None:
+    observation = make_observation(
+        "obs_support",
+        "2026-01-02T00:00:00Z",
+        resource_id="support_1",
+        state=ObservedState.PRESENT,
+        category="SUPPORT_MESSAGE",
+        system_id="support_platform",
+        attributes={"message_text": "null"},
+    )
+    state = reconstruct(
+        [observation],
+        [],
+        make_link("support_1", categories=("SUPPORT_MESSAGE",)),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.PRESENT
+
+
+def test_support_system_without_category_still_recognizes_redacted_marker() -> None:
+    observation = make_observation(
+        "obs_support",
+        "2026-01-02T00:00:00Z",
+        resource_id="support_1",
+        state=ObservedState.PRESENT,
+        category=None,
+        system_id="support_platform",
+        attributes={"message_text": "[REDACTED]"},
+    )
+    observation = make_observation(
+        "obs_support",
+        "2026-01-02T00:00:00Z",
+        resource_id="support_1",
+        state=ObservedState.PRESENT,
+        category=None,
+        system_id="support_platform",
+        attributes={"message_text": "[REDACTED]"},
+    )
+    state = reconstruct(
+        [observation],
+        [],
+        make_link("support_1", categories=()),
+        "2026-01-03T00:00:00Z",
+    )
+    assert state.state == ObservedState.REDACTED
+    assert state.verified is True
