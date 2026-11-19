@@ -220,6 +220,17 @@ def _build_parser() -> argparse.ArgumentParser:
     compare_output.add_argument(
         "--json-out", required=True, help="Comparison JSON path inside this project."
     )
+
+    smartshop = subparsers.add_parser(
+        "audit-smartshop",
+        help="Audit one SmartShop deletion request from PostgreSQL.",
+    )
+    smartshop.add_argument("--request-id", required=True, help="SmartShop deletion request_id.")
+    smartshop.add_argument(
+        "--rules",
+        default=None,
+        help="Path to deletion_rules.csv (defaults to challenge dataset path).",
+    )
     return parser
 
 
@@ -723,9 +734,34 @@ def _cmd_compare_output(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_audit_smartshop(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from .config import Settings
+
+    from .smartshop.audit import audit_smartshop_request
+
+    if args.rules:
+        rules_path = Path(args.rules).expanduser().resolve()
+    else:
+        rules_path = Path(__file__).resolve().parent / "smartshop" / "deletion_rules.csv"
+    result = audit_smartshop_request(args.request_id, rules_path=rules_path)
+    print(f"case_id          : {result.case_id}")
+    print(f"deletion_status  : {result.deletion_status.value}")
+    print(f"steps            : {len(result.steps)}")
+    print(f"provisional      : {result.provisional}")
+    print(f"status_reasons   : {', '.join(result.status_reasons)}")
+    for step in result.steps:
+        print(f"  {step.step_no}. [{step.phase.value}] {step.operation.value} {step.state.value} {step.system_id}/{step.resource_id}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "audit-smartshop":
+        return _cmd_audit_smartshop(args)
 
     try:
         settings = Settings.from_environment(
@@ -759,6 +795,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_evaluate_sample(settings, args)
         if args.command == "compare-output":
             return _cmd_compare_output(settings, args)
+        if args.command == "audit-smartshop":
+            return _cmd_audit_smartshop(args)
         parser.error(f"Unknown command: {args.command}")
         return 2
     except PrivacyGuardError as exc:

@@ -366,6 +366,13 @@ def _effective_observation_state(observation: EvidenceObservation) -> _Effective
             False,
         )
 
+    if _is_support_message(observation) and _has_explicit_null_support_pii_fields(observation):
+        return _EffectiveState(
+            ObservedState.REDACTED,
+            "support record stores explicitly null requester PII fields",
+            min(0.9, confidence),
+            False,
+        )
     if tombstone and not has_direct_identifiers:
         if state in {ObservedState.UNKNOWN, ObservedState.PRESENT}:
             explicit_nulls = _has_explicit_null_identifier_fields(observation)
@@ -427,7 +434,7 @@ def _has_explicit_null_identifier_fields(observation: EvidenceObservation) -> bo
     direct_fields = ("name", "email", "phone")
     attributes = observation.attributes
     return all(field in attributes for field in direct_fields) and all(
-        attributes.get(field) in {None, "", "[REDACTED]"}
+        _is_null_like(attributes.get(field))
         for field in direct_fields
     )
 
@@ -439,9 +446,18 @@ def _has_explicit_null_support_pii_fields(observation: EvidenceObservation) -> b
     fields = ("requester_name", "requester_email", "requester_phone")
     attributes = observation.attributes
     return all(field in attributes for field in fields) and all(
-        attributes.get(field) in {None, "", "[REDACTED]"}
+        _is_null_like(attributes.get(field))
         for field in fields
     )
+
+
+def _is_null_like(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return stripped in {"", "[REDACTED]"} or stripped.lower() == "null"
 
 
 def _record_presence_evidence(
@@ -586,7 +602,11 @@ def _is_analytics(observation: EvidenceObservation) -> bool:
 
 
 def _is_support_message(observation: EvidenceObservation) -> bool:
-    return (observation.data_category or "") in _SUPPORT_MESSAGE_CATEGORIES
+    if (observation.data_category or "") in _SUPPORT_MESSAGE_CATEGORIES:
+        return True
+    # A record served by support_platform is a support record even when the
+    # parser could not extract a data_category. An ID prefix is not used here.
+    return observation.system_id == "support_platform"
 
 
 def _tombstone_exposed(
