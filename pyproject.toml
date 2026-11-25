@@ -9,9 +9,15 @@ description = "AI-powered personal data deletion audit agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.13,<2",
+    "fastapi>=0.115,<1",
     "pydantic>=2.7",
     "pypdf>=7.0",
     "pillow>=13.0",
+    "psycopg[binary]>=3.2,<4",
+    "psycopg2-binary>=2.9,<3",
+    "sqlalchemy>=2.0,<3",
+    "uvicorn[standard]>=0.32,<1",
 ]
 
 [project.optional-dependencies]

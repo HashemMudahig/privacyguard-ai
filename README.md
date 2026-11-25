@@ -807,3 +807,22 @@ public answers cite account identifiers (`account_001`, `account_002`,
 `account_004`) that are not attributable from participant-visible evidence, so
 they are not inferred. The final Arabic engineering report is
 `reports/sprint3c_correctness_review_final_ar.md`.
+
+## Sprint 4C.1: PostgreSQL platform persistence
+
+The FastAPI platform now requires `PRIVACYGUARD_DATABASE_URL` and uses the
+dedicated PostgreSQL database `privacyguard_platform`. Alembic requires the
+separate `PRIVACYGUARD_MIGRATION_DATABASE_URL`; both URLs are rejected if they
+target another PostgreSQL database. Runtime startup no longer creates tables.
+
+SQLite support is intentionally limited to explicit test injection such as
+`create_app("sqlite:///:memory:")`. The existing `privacyguard_platform.db` is
+a read-only migration source and is ignored by Git. Provisioning, migration,
+legacy-copy, and verification instructions are in
+`docs/postgresql_platform.md`.
+
+PostgreSQL operations use a discovery-first safety gate. Run
+`scripts/discover_platform_postgres.sql` with locally configured authentication,
+review existing databases and roles, and obtain explicit approval before
+provisioning or Alembic changes. Live PostgreSQL integration has not yet been
+verified in this workspace because catalog authentication was unavailable.

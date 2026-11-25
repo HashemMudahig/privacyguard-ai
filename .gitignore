@@ -17,6 +17,7 @@ dataset/
 
 # Generated outputs and local reports
 output.csv
+privacyguard_platform.db
 *.log
 reports/
 .pytest_tmp/
